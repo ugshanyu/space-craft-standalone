@@ -250,7 +250,7 @@ export default function Page() {
         if (data.room_id !== rid) return;
         setStatus(`Server error: ${data.code || "unknown"}`);
       });
-    } catch (err) {
+    } catch (err: any) {
       setStatus(`Connection failed: ${err.message || String(err)}`);
       console.error("[Direct] Connection error:", err);
     }
