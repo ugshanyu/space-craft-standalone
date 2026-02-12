@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#020617"/>
+      <stop offset="100%" stop-color="#0f172a"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <circle cx="220" cy="140" r="2" fill="#e2e8f0"/>
+  <circle cx="1020" cy="220" r="3" fill="#e2e8f0"/>
+  <circle cx="920" cy="80" r="1.5" fill="#e2e8f0"/>
+  <polygon points="320,315 260,350 260,280" fill="#22d3ee"/>
+  <polygon points="880,315 940,350 940,280" fill="#f59e0b"/>
+  <text x="600" y="320" text-anchor="middle" fill="#e2e8f0" font-size="72" font-family="Arial, sans-serif" font-weight="700">Space Craft</text>
+  <text x="600" y="372" text-anchor="middle" fill="#94a3b8" font-size="28" font-family="Arial, sans-serif">Authoritative Multiplayer</text>
+</svg>

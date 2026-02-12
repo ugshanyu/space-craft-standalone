@@ -1,0 +1,592 @@
+/**
+ * Usion Design System v1.0
+ * 
+ * Universal styling for Mini Apps
+ * Import via: <link rel="stylesheet" href="https://your-domain/usion-design-system.css">
+ * 
+ * Or load from CDN/backend endpoint
+ */
+
+/* ============================================
+   CSS Variables (Design Tokens)
+   ============================================ */
+:root {
+  /* Colors */
+  --usion-black: #000000;
+  --usion-white: #ffffff;
+  --usion-gray-50: #fafafa;
+  --usion-gray-100: #f5f5f5;
+  --usion-gray-200: #eaeaea;
+  --usion-gray-300: #d4d4d4;
+  --usion-gray-400: #a3a3a3;
+  --usion-gray-500: #737373;
+  --usion-gray-600: #666666;
+  --usion-gray-700: #404040;
+  --usion-gray-800: #262626;
+  --usion-gray-900: #171717;
+
+  /* Semantic Colors */
+  --usion-primary: var(--usion-black);
+  --usion-primary-hover: var(--usion-gray-800);
+  --usion-background: var(--usion-white);
+  --usion-surface: var(--usion-gray-50);
+  --usion-border: var(--usion-gray-200);
+  --usion-text: var(--usion-black);
+  --usion-text-secondary: var(--usion-gray-600);
+  --usion-text-muted: var(--usion-gray-400);
+  
+  /* Status Colors */
+  --usion-success: #10b981;
+  --usion-warning: #f59e0b;
+  --usion-error: #ef4444;
+  --usion-info: #3b82f6;
+
+  /* Typography */
+  --usion-font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  --usion-font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Monaco, Consolas, monospace;
+  
+  /* Font Sizes */
+  --usion-text-xs: 12px;
+  --usion-text-sm: 14px;
+  --usion-text-base: 16px;
+  --usion-text-lg: 18px;
+  --usion-text-xl: 20px;
+  --usion-text-2xl: 24px;
+  --usion-text-3xl: 32px;
+  --usion-text-4xl: 40px;
+
+  /* Font Weights */
+  --usion-font-normal: 400;
+  --usion-font-medium: 500;
+  --usion-font-semibold: 600;
+  --usion-font-bold: 700;
+  --usion-font-extrabold: 800;
+
+  /* Spacing */
+  --usion-space-1: 4px;
+  --usion-space-2: 8px;
+  --usion-space-3: 12px;
+  --usion-space-4: 16px;
+  --usion-space-5: 20px;
+  --usion-space-6: 24px;
+  --usion-space-8: 32px;
+  --usion-space-10: 40px;
+  --usion-space-12: 48px;
+
+  /* Border Radius */
+  --usion-radius-sm: 6px;
+  --usion-radius-md: 8px;
+  --usion-radius-lg: 12px;
+  --usion-radius-xl: 16px;
+  --usion-radius-full: 9999px;
+
+  /* Shadows */
+  --usion-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --usion-shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+  --usion-shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+
+  /* Transitions */
+  --usion-transition-fast: 150ms ease;
+  --usion-transition-normal: 200ms ease;
+  --usion-transition-slow: 300ms ease;
+
+  /* Safe Areas */
+  --usion-safe-top: env(safe-area-inset-top);
+  --usion-safe-bottom: env(safe-area-inset-bottom);
+  --usion-safe-left: env(safe-area-inset-left);
+  --usion-safe-right: env(safe-area-inset-right);
+}
+
+/* ============================================
+   Base Styles
+   ============================================ */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  -webkit-tap-highlight-color: transparent;
+}
+
+body {
+  font-family: var(--usion-font-family);
+  font-size: var(--usion-text-base);
+  line-height: 1.5;
+  color: var(--usion-text);
+  background-color: var(--usion-background);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ============================================
+   Layout Components
+   ============================================ */
+.usion-container {
+  padding: var(--usion-space-6);
+  max-width: 100%;
+}
+
+.usion-page {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.usion-content {
+  flex: 1;
+  padding: var(--usion-space-6);
+  overflow-y: auto;
+}
+
+.usion-footer {
+  padding: var(--usion-space-4) var(--usion-space-6);
+  padding-bottom: calc(var(--usion-space-4) + var(--usion-safe-bottom));
+  background: var(--usion-background);
+  border-top: 1px solid var(--usion-border);
+}
+
+/* ============================================
+   Typography
+   ============================================ */
+.usion-title {
+  font-size: var(--usion-text-3xl);
+  font-weight: var(--usion-font-extrabold);
+  letter-spacing: -1.5px;
+  line-height: 1.2;
+  color: var(--usion-text);
+  margin-bottom: var(--usion-space-2);
+}
+
+.usion-subtitle {
+  font-size: var(--usion-text-sm);
+  color: var(--usion-text-secondary);
+  margin-bottom: var(--usion-space-8);
+}
+
+.usion-heading {
+  font-size: var(--usion-text-xl);
+  font-weight: var(--usion-font-bold);
+  letter-spacing: -0.5px;
+  color: var(--usion-text);
+  margin-bottom: var(--usion-space-4);
+}
+
+.usion-label {
+  display: block;
+  font-size: var(--usion-text-xs);
+  font-weight: var(--usion-font-semibold);
+  color: var(--usion-text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: var(--usion-space-2);
+}
+
+.usion-text {
+  font-size: var(--usion-text-base);
+  color: var(--usion-text);
+}
+
+.usion-text-sm {
+  font-size: var(--usion-text-sm);
+}
+
+.usion-text-muted {
+  color: var(--usion-text-muted);
+}
+
+/* ============================================
+   Buttons
+   ============================================ */
+.usion-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  padding: var(--usion-space-4) var(--usion-space-6);
+  font-family: var(--usion-font-family);
+  font-size: var(--usion-text-base);
+  font-weight: var(--usion-font-semibold);
+  line-height: 1;
+  text-decoration: none;
+  border: none;
+  border-radius: var(--usion-radius-lg);
+  cursor: pointer;
+  transition: all var(--usion-transition-normal);
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.usion-btn:active {
+  transform: scale(0.98);
+}
+
+.usion-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+/* Primary Button (Default) */
+.usion-btn-primary,
+.usion-btn {
+  background-color: var(--usion-primary);
+  color: var(--usion-white);
+}
+
+.usion-btn-primary:hover:not(:disabled),
+.usion-btn:hover:not(:disabled) {
+  background-color: var(--usion-primary-hover);
+}
+
+.usion-btn-primary:disabled,
+.usion-btn:disabled {
+  background-color: var(--usion-gray-200);
+  color: var(--usion-gray-400);
+}
+
+/* Secondary Button */
+.usion-btn-secondary {
+  background-color: var(--usion-surface);
+  color: var(--usion-text);
+  border: 1px solid var(--usion-border);
+}
+
+.usion-btn-secondary:hover:not(:disabled) {
+  background-color: var(--usion-gray-100);
+}
+
+/* Ghost Button */
+.usion-btn-ghost {
+  background-color: transparent;
+  color: var(--usion-text);
+}
+
+.usion-btn-ghost:hover:not(:disabled) {
+  background-color: var(--usion-surface);
+}
+
+/* Button Sizes */
+.usion-btn-sm {
+  padding: var(--usion-space-2) var(--usion-space-4);
+  font-size: var(--usion-text-sm);
+  border-radius: var(--usion-radius-md);
+}
+
+.usion-btn-lg {
+  padding: var(--usion-space-5) var(--usion-space-8);
+  font-size: var(--usion-text-lg);
+}
+
+/* Loading State */
+.usion-btn-loading {
+  position: relative;
+  color: transparent !important;
+  pointer-events: none;
+}
+
+.usion-btn-loading::after {
+  content: '';
+  position: absolute;
+  width: 20px;
+  height: 20px;
+  top: 50%;
+  left: 50%;
+  margin: -10px 0 0 -10px;
+  border: 2px solid currentColor;
+  border-radius: 50%;
+  border-top-color: transparent;
+  animation: usion-spin 0.8s linear infinite;
+}
+
+.usion-btn-primary.usion-btn-loading::after,
+.usion-btn-loading::after {
+  border-color: var(--usion-white);
+  border-top-color: transparent;
+}
+
+@keyframes usion-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ============================================
+   Form Elements
+   ============================================ */
+.usion-input,
+.usion-textarea,
+.usion-select {
+  width: 100%;
+  padding: var(--usion-space-4);
+  font-family: var(--usion-font-family);
+  font-size: var(--usion-text-base);
+  color: var(--usion-text);
+  background-color: var(--usion-surface);
+  border: 1px solid var(--usion-border);
+  border-radius: var(--usion-radius-lg);
+  transition: all var(--usion-transition-normal);
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.usion-input::placeholder,
+.usion-textarea::placeholder {
+  color: var(--usion-text-muted);
+}
+
+.usion-input:focus,
+.usion-textarea:focus,
+.usion-select:focus {
+  outline: none;
+  border-color: var(--usion-primary);
+  background-color: var(--usion-background);
+}
+
+.usion-textarea {
+  min-height: 120px;
+  resize: vertical;
+}
+
+/* Character Counter */
+.usion-char-count {
+  text-align: right;
+  font-size: var(--usion-text-xs);
+  color: var(--usion-text-muted);
+  margin-top: var(--usion-space-1);
+}
+
+.usion-char-count.warning {
+  color: var(--usion-warning);
+}
+
+.usion-char-count.error {
+  color: var(--usion-error);
+}
+
+/* ============================================
+   Cards & Surfaces
+   ============================================ */
+.usion-card {
+  background-color: var(--usion-background);
+  border: 1px solid var(--usion-border);
+  border-radius: var(--usion-radius-lg);
+  padding: var(--usion-space-4);
+}
+
+.usion-surface {
+  background-color: var(--usion-surface);
+  border-radius: var(--usion-radius-lg);
+  padding: var(--usion-space-4);
+}
+
+/* ============================================
+   Selection Grid (for options like voices)
+   ============================================ */
+.usion-selection-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: var(--usion-space-3);
+}
+
+.usion-selection-item {
+  background-color: var(--usion-surface);
+  border: 2px solid transparent;
+  border-radius: var(--usion-radius-lg);
+  padding: var(--usion-space-4);
+  cursor: pointer;
+  transition: all var(--usion-transition-normal);
+}
+
+.usion-selection-item:hover {
+  background-color: var(--usion-gray-100);
+}
+
+.usion-selection-item.selected {
+  border-color: var(--usion-primary);
+  background-color: var(--usion-background);
+}
+
+.usion-selection-item .title {
+  font-weight: var(--usion-font-semibold);
+  font-size: var(--usion-text-base);
+  margin-bottom: var(--usion-space-1);
+}
+
+.usion-selection-item .subtitle {
+  font-size: var(--usion-text-xs);
+  color: var(--usion-text-secondary);
+}
+
+/* ============================================
+   Image Grid
+   ============================================ */
+.usion-image-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: var(--usion-space-3);
+}
+
+.usion-image-item {
+  aspect-ratio: 1;
+  border-radius: var(--usion-radius-md);
+  overflow: hidden;
+  border: 2px solid transparent;
+  cursor: pointer;
+  transition: all var(--usion-transition-normal);
+}
+
+.usion-image-item:hover {
+  opacity: 0.9;
+}
+
+.usion-image-item.selected {
+  border-color: var(--usion-primary);
+  transform: scale(0.98);
+}
+
+.usion-image-item img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+/* ============================================
+   Upload Box
+   ============================================ */
+.usion-upload-box {
+  aspect-ratio: 1;
+  background-color: var(--usion-surface);
+  border: 1px dashed var(--usion-border);
+  border-radius: var(--usion-radius-lg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all var(--usion-transition-normal);
+  overflow: hidden;
+}
+
+.usion-upload-box:hover {
+  border-color: var(--usion-gray-400);
+  background-color: var(--usion-gray-100);
+}
+
+.usion-upload-box .icon {
+  font-size: 24px;
+  color: var(--usion-text-muted);
+}
+
+.usion-upload-box.has-image {
+  border-style: solid;
+  border-color: var(--usion-border);
+}
+
+.usion-upload-box img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* ============================================
+   Utilities
+   ============================================ */
+
+/* Flex */
+.usion-flex { display: flex; }
+.usion-flex-col { flex-direction: column; }
+.usion-flex-row { flex-direction: row; }
+.usion-items-center { align-items: center; }
+.usion-justify-center { justify-content: center; }
+.usion-justify-between { justify-content: space-between; }
+.usion-gap-2 { gap: var(--usion-space-2); }
+.usion-gap-3 { gap: var(--usion-space-3); }
+.usion-gap-4 { gap: var(--usion-space-4); }
+
+/* Spacing */
+.usion-mt-2 { margin-top: var(--usion-space-2); }
+.usion-mt-4 { margin-top: var(--usion-space-4); }
+.usion-mt-6 { margin-top: var(--usion-space-6); }
+.usion-mb-2 { margin-bottom: var(--usion-space-2); }
+.usion-mb-4 { margin-bottom: var(--usion-space-4); }
+.usion-mb-6 { margin-bottom: var(--usion-space-6); }
+
+/* Text */
+.usion-text-center { text-align: center; }
+.usion-text-right { text-align: right; }
+
+/* Display */
+.usion-hidden { display: none; }
+.usion-visible { display: block; }
+
+/* ============================================
+   Audio Player
+   ============================================ */
+.usion-audio-player {
+  width: 100%;
+  margin-top: var(--usion-space-3);
+}
+
+/* ============================================
+   Result Section
+   ============================================ */
+.usion-result {
+  margin-top: var(--usion-space-6);
+  padding: var(--usion-space-5);
+  background-color: var(--usion-surface);
+  border-radius: var(--usion-radius-lg);
+  text-align: center;
+}
+
+.usion-result.hidden {
+  display: none;
+}
+
+/* ============================================
+   Step Indicator
+   ============================================ */
+.usion-steps {
+  display: flex;
+  gap: var(--usion-space-2);
+  margin-bottom: var(--usion-space-6);
+}
+
+.usion-step {
+  flex: 1;
+  height: 4px;
+  background-color: var(--usion-gray-200);
+  border-radius: var(--usion-radius-full);
+  transition: background-color var(--usion-transition-normal);
+}
+
+.usion-step.active,
+.usion-step.completed {
+  background-color: var(--usion-primary);
+}
+
+/* ============================================
+   Animations
+   ============================================ */
+@keyframes usion-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes usion-slide-up {
+  from { 
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to { 
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.usion-animate-fade-in {
+  animation: usion-fade-in var(--usion-transition-normal);
+}
+
+.usion-animate-slide-up {
+  animation: usion-slide-up var(--usion-transition-slow);
+}
