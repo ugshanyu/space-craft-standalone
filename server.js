@@ -222,51 +222,23 @@ function handleMessage(ws, session, msg) {
   if (type === 'join') {
     let room = rooms.get(session.roomId);
     if (!room) {
-      fetchRoomInfo(session.roomId).then((roomInfo) => {
-        let existingRoom = rooms.get(session.roomId);
-        if (existingRoom) {
-          existingRoom.addSession(session.sessionId, session.userId, ws);
-          const w = Math.max(0, existingRoom.minPlayers - existingRoom.connectedUserIds.size);
-          ws.send(JSON.stringify({
-            type: 'joined',
-            payload: {
-              room_id: session.roomId,
-              player_id: session.userId,
-              player_ids: [...existingRoom.connectedUserIds],
-              waiting_for: w,
-            },
-          }));
-          existingRoom.broadcast('player_joined', { player_id: session.userId, player_ids: [...existingRoom.connectedUserIds] });
-          if (!existingRoom.running && existingRoom.connectedUserIds.size >= existingRoom.minPlayers) {
-            console.log(`[ROOM] All ${existingRoom.minPlayers} players connected, starting game in room ${session.roomId}`);
-            existingRoom.start();
-          }
-          return;
-        }
+      room = new RoomRuntime(session.roomId, [], MIN_PLAYERS);
+      rooms.set(session.roomId, room);
+      console.log(`[ROOM] Created room ${session.roomId} with minPlayers=${room.minPlayers}`);
+    }
 
-        const maxPlayers = roomInfo?.game_config?.max_players || MIN_PLAYERS;
-        const newRoom = new RoomRuntime(session.roomId, [], maxPlayers);
-        rooms.set(session.roomId, newRoom);
-        newRoom.addSession(session.sessionId, session.userId, ws);
-
-        const waiting = Math.max(0, newRoom.minPlayers - newRoom.connectedUserIds.size);
-        ws.send(JSON.stringify({
-          type: 'joined',
-          payload: {
-            room_id: session.roomId,
-            player_id: session.userId,
-            player_ids: [...newRoom.connectedUserIds],
-            waiting_for: waiting,
-          },
-        }));
-        newRoom.broadcast('player_joined', { player_id: session.userId, player_ids: [...newRoom.connectedUserIds] });
-
-        if (newRoom.connectedUserIds.size >= newRoom.minPlayers) {
-          newRoom.start();
-        } else {
-          console.log(`[ROOM] Waiting for ${waiting} more player(s) in room ${session.roomId}`);
-        }
-      });
+    // Idempotent join: same session reconnect/join retries should not duplicate state.
+    if (room.sessions.has(session.sessionId)) {
+      const waitingFor = Math.max(0, room.minPlayers - room.connectedUserIds.size);
+      ws.send(JSON.stringify({
+        type: 'joined',
+        payload: {
+          room_id: session.roomId,
+          player_id: session.userId,
+          player_ids: [...room.connectedUserIds],
+          waiting_for: waitingFor,
+        },
+      }));
       return;
     }
 

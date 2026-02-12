@@ -957,7 +957,6 @@
           self.directSocket = ws;
 
           var opened = false;
-          var joinSent = false;
           var timeout = setTimeout(function() {
             if (!opened) {
               try { ws.close(); } catch (e) {}
@@ -968,8 +967,7 @@
           ws.onopen = function() {
             opened = true;
             clearTimeout(timeout);
-            console.log('[SDK] WebSocket onopen fired, waiting for auth_ok from server...');
-            // Don't send join here - wait for auth_ok from server
+            console.log('[SDK] WebSocket onopen fired');
             resolve();
           };
 
@@ -1002,16 +1000,6 @@
           };
 
           ws.onmessage = function(evt) {
-            try {
-              var data = JSON.parse(evt.data);
-              // Server sends auth_ok after validating our token - now send join
-              if (data.type === 'auth_ok' && !joinSent) {
-                joinSent = true;
-                console.log('[SDK] Received auth_ok from server, sending join now');
-                self._sendDirect('join', {});
-                return;
-              }
-            } catch(e) {}
             self._handleDirectMessage(evt && evt.data);
           };
         });
