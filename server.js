@@ -347,12 +347,37 @@ app.prepare().then(() => {
     const url = new URL(req.url, `http://localhost:${PORT}`);
     const token = url.searchParams.get('token');
     
-    // Allow non-websocket requests (Next.js pages) to pass through if they hit this handler?
-    // Actually wss handles the upgrade request. Next.js handles normal requests.
-    
     let session = { userId: null, roomId: null, sessionId: null };
     let pendingMessages = []; 
     let authComplete = false;
+
+    // Register message handler FIRST, before any async operations
+    ws.on('message', (data) => {
+      console.log(`[WS] RAW message received from user=${session.userId?.slice(0,8) || '(pending)'}, length=${data.length}`);
+      try {
+        const msg = JSON.parse(data.toString());
+        if (!authComplete) {
+          console.log(`[WS] Queuing message (auth pending): type=${msg.type}`);
+          pendingMessages.push(msg);
+          return;
+        }
+        handleMessage(ws, session, msg);
+      } catch (err) {
+        console.error('[WS] Message error:', err.message);
+      }
+    });
+
+    ws.on('close', () => {
+      if (session.roomId && session.sessionId) {
+        const room = rooms.get(session.roomId);
+        if (room) {
+          room.removeSession(session.sessionId);
+          room.broadcast('player_left', { player_id: session.userId });
+        }
+      }
+    });
+
+    console.log('[WS] Message handler registered, starting auth...');
 
     if (!token) {
       ws.send(JSON.stringify({ type: 'error', payload: { code: 'NO_TOKEN', message: 'Missing access token' } }));
@@ -384,33 +409,6 @@ app.prepare().then(() => {
         ws.send(JSON.stringify({ type: 'error', payload: { code: 'INVALID_TOKEN', message: err.message } }));
         ws.close();
       });
-
-    ws.on('message', (data) => {
-      console.log(`[WS] RAW message received from user=${session.userId?.slice(0,8) || '(pending)'}, length=${data.length}`);
-      try {
-        const msg = JSON.parse(data.toString());
-        if (!authComplete) {
-          console.log(`[WS] Queuing message (auth pending): type=${msg.type}`);
-          pendingMessages.push(msg);
-          return;
-        }
-        handleMessage(ws, session, msg);
-      } catch (err) {
-        console.error('[WS] Message error:', err.message);
-      }
-    });
-
-    console.log('[WS] Message handler registered, starting auth...');
-
-    ws.on('close', () => {
-      if (session.roomId && session.sessionId) {
-        const room = rooms.get(session.roomId);
-        if (room) {
-          room.removeSession(session.sessionId);
-          room.broadcast('player_left', { player_id: session.userId });
-        }
-      }
-    });
   });
 
   server.listen(PORT, (err) => {
