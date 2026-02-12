@@ -335,13 +335,26 @@ app.prepare().then(() => {
     handle(req, res, parsedUrl);
   });
 
-  const wss = new WebSocketServer({ server });
+  // Use noServer mode to avoid conflicts with Next.js WebSocket handling
+  const wss = new WebSocketServer({ noServer: true });
 
-  wss.on('connection', (ws, req) => {
-    // Ignore Next.js HMR connections
-    if (req.url?.includes('_next/webpack-hmr')) {
+  // Manually handle upgrade requests - route game WS to our server, ignore Next.js internal WS
+  server.on('upgrade', (request, socket, head) => {
+    // Let Next.js handle its own WebSocket connections (HMR, etc.)
+    if (request.url?.includes('_next')) {
+      // Don't handle - let it fall through or destroy
+      socket.destroy();
       return;
     }
+
+    console.log(`[WS] Upgrade request: url=${request.url?.slice(0, 80)}`);
+
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
+  });
+
+  wss.on('connection', (ws, req) => {
 
     // Note: req.url includes the path, e.g., /?token=...
     const url = new URL(req.url, `http://localhost:${PORT}`);
