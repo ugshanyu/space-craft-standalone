@@ -329,6 +329,11 @@ app.prepare().then(() => {
   const wss = new WebSocketServer({ server });
 
   wss.on('connection', (ws, req) => {
+    // Ignore Next.js HMR connections
+    if (req.url?.includes('_next/webpack-hmr')) {
+      return;
+    }
+
     // Note: req.url includes the path, e.g., /?token=...
     const url = new URL(req.url, `http://localhost:${PORT}`);
     const token = url.searchParams.get('token');
