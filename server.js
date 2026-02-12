@@ -409,6 +409,10 @@ app.prepare().then(() => {
         authComplete = true;
         console.log('[WS] Connection authenticated:', session);
 
+        // Send auth_ok to client so it knows auth succeeded and can send join
+        ws.send(JSON.stringify({ type: 'auth_ok', payload: { session_id: session.sessionId, room_id: session.roomId } }));
+        console.log('[WS] Sent auth_ok to client');
+
         if (pendingMessages.length > 0) {
           console.log(`[WS] Processing ${pendingMessages.length} queued message(s)`);
           for (const msg of pendingMessages) {
