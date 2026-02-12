@@ -6,6 +6,7 @@
 import { createRemoteJWKSet, jwtVerify, decodeJwt } from 'jose';
 
 let jwksCache = null;
+const AUTH_DIAG = process.env.AUTH_DIAG === '1';
 
 function getJWKS(jwksUrl) {
   if (!jwksCache) {
@@ -24,15 +25,17 @@ export async function validateAccessToken(token, {
   const jwks = getJWKS(jwksUrl);
   const expectedAudience = `${expectedAudiencePrefix}${expectedServiceId}`;
 
-  // Debug: decode without verification to inspect claims
-  try {
-    const decoded = decodeJwt(token);
-    const now = Math.floor(Date.now() / 1000);
-    console.log('[AUTH] Token claims:', decoded); // Log ALL claims
-    console.log('[AUTH] Time check: now=', now, 'iat=', decoded.iat, 'exp=', decoded.exp,
-      'iat_diff=', now - decoded.iat, 'exp_remaining=', decoded.exp - now);
-  } catch (e) {
-    console.error('[AUTH] Failed to decode token:', e.message);
+  // Optional diagnostics (disabled by default to reduce auth path latency/log noise).
+  if (AUTH_DIAG) {
+    try {
+      const decoded = decodeJwt(token);
+      const now = Math.floor(Date.now() / 1000);
+      console.log('[AUTH] Token claims:', decoded);
+      console.log('[AUTH] Time check: now=', now, 'iat=', decoded.iat, 'exp=', decoded.exp,
+        'iat_diff=', now - decoded.iat, 'exp_remaining=', decoded.exp - now);
+    } catch (e) {
+      console.error('[AUTH] Failed to decode token:', e.message);
+    }
   }
 
   try {

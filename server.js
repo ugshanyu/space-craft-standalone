@@ -402,12 +402,12 @@ function handleMessage(ws, session, msg, ctx = {}) {
     }
   } else if (type === 'ping') {
     const room = rooms.get(session.roomId);
-    if (!room) return;
+    const serverTick = room ? room.serverTick : 0;
     sendJson(ws, cid, {
       type: 'pong',
       payload: {
         room_id: session.roomId,
-        server_tick: room.serverTick,
+        server_tick: serverTick,
         server_ts: Date.now(),
       },
     }, 'pong');

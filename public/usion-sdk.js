@@ -748,6 +748,8 @@
       _directJoinResolve: null,
       _directJoinReject: null,
       _directJoinTimeout: null,
+      _directKeepAliveTimer: null,
+      _directKeepAliveIntervalMs: 5000,
       _useProxy: false,
       _proxyListenerSetup: false,
 
@@ -865,6 +867,7 @@
             self.connected = true;
             self._connecting = false;
             Usion.log('Direct game socket connected');
+            self._startDirectKeepAlive();
           })
           .catch(function(err) {
             self._connecting = false;
@@ -1002,6 +1005,7 @@
           };
 
           ws.onclose = function(evt) {
+            self._stopDirectKeepAlive();
             console.log('[SDK] WebSocket onclose', {
               code: evt && evt.code !== undefined ? evt.code : null,
               reason: evt && evt.reason ? evt.reason : '',
@@ -1043,6 +1047,24 @@
             self._handleDirectMessage(evt && evt.data);
           };
         });
+      },
+
+      _startDirectKeepAlive: function() {
+        var self = this;
+        self._stopDirectKeepAlive();
+        self._directKeepAliveTimer = setInterval(function() {
+          if (!self.directMode || !self.directSocket || self.directSocket.readyState !== WebSocket.OPEN) return;
+          self._sendDirect('ping', { source: 'sdk_keepalive', client_ts: Date.now() });
+        }, self._directKeepAliveIntervalMs);
+        console.log('[SDK] Direct keepalive started', { interval_ms: self._directKeepAliveIntervalMs });
+      },
+
+      _stopDirectKeepAlive: function() {
+        if (this._directKeepAliveTimer) {
+          clearInterval(this._directKeepAliveTimer);
+          this._directKeepAliveTimer = null;
+          console.log('[SDK] Direct keepalive stopped');
+        }
       },
 
       _sendDirect: function(type, payload) {
@@ -1546,6 +1568,7 @@
         const self = this;
 
         if (self.directMode) {
+          self._stopDirectKeepAlive();
           if (self.roomId) self._sendDirect('leave', {});
           self.roomId = null;
           self._lastSequence = 0;
@@ -1741,6 +1764,7 @@
         const self = this;
 
         if (self.directMode) {
+          self._stopDirectKeepAlive();
           if (self.directSocket) {
             try { self.directSocket.close(); } catch (e) {}
           }
