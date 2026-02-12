@@ -390,6 +390,25 @@ app.prepare().then(() => {
       }
     });
 
+    // Diagnostic: test raw socket and ping/pong
+    console.log(`[WS] Socket state: readyState=${ws.readyState} bufferedAmount=${ws.bufferedAmount}`);
+    
+    ws.on('pong', (data) => {
+      console.log('[WS] PONG received:', data.toString());
+    });
+
+    ws.on('error', (err) => {
+      console.error('[WS] Socket error:', err.message);
+    });
+
+    // Send a ping to test the connection
+    try {
+      ws.ping('hello');
+      console.log('[WS] Ping sent');
+    } catch(e) {
+      console.error('[WS] Ping failed:', e.message);
+    }
+
     console.log('[WS] Message handler registered, starting auth...');
 
     if (!token) {
