@@ -22,8 +22,56 @@ const TICK_RATE_HZ = 20;
 const TICK_MS = 1000 / TICK_RATE_HZ;
 const SNAPSHOT_INTERVAL_TICKS = 20;
 const MIN_PLAYERS = 2;
+const WS_DIAG = process.env.WS_DIAG !== '0';
+const WS_INPUT_TRACE = process.env.WS_INPUT_TRACE === '1';
+const READY_STATE = ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'];
+let connectionSeq = 0;
 
 const rooms = new Map(); // roomId -> RoomRuntime
+
+function readyStateName(ws) {
+  return READY_STATE[ws.readyState] || String(ws.readyState);
+}
+
+function shortId(value, size = 8) {
+  if (!value) return '(none)';
+  const s = String(value);
+  return s.length > size ? s.slice(0, size) : s;
+}
+
+function diag(cid, event, details = undefined) {
+  if (!WS_DIAG) return;
+  if (details !== undefined) {
+    console.log(`[WS][${cid}] ${event}`, details);
+  } else {
+    console.log(`[WS][${cid}] ${event}`);
+  }
+}
+
+function sendJson(ws, cid, frame, label) {
+  const text = JSON.stringify(frame);
+  const state = readyStateName(ws);
+  if (ws.readyState !== ws.OPEN) {
+    diag(cid, `send_skip:${label}`, { state, bytes: text.length });
+    return false;
+  }
+  ws.send(text, (err) => {
+    if (err) {
+      console.error(`[WS][${cid}] send_error:${label}`, err.message);
+    } else {
+      diag(cid, `send_ok:${label}`, { bytes: text.length });
+    }
+  });
+  return true;
+}
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[PROCESS] unhandledRejection', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[PROCESS] uncaughtException', err);
+});
 
 class RoomRuntime {
   constructor(roomId, playerIds, minPlayers) {
@@ -259,13 +307,22 @@ async function fetchRoomInfo(roomId) {
   }
 }
 
-function handleMessage(ws, session, msg) {
+function handleMessage(ws, session, msg, ctx = {}) {
+  const cid = ctx.cid || 'na';
   const { type, payload } = msg;
   const topSeq = msg.seq || 0;
   const topTs = msg.ts || Date.now();
 
-  if (type !== 'input') {
-    console.log(`[MSG] type=${type} user=${session.userId?.slice(0,8)} room=${session.roomId?.slice(0,8)}`);
+  if (type !== 'input' || WS_INPUT_TRACE) {
+    diag(cid, 'message', {
+      type,
+      seq: topSeq,
+      ts: topTs,
+      sessionId: shortId(session.sessionId),
+      userId: shortId(session.userId),
+      roomId: shortId(session.roomId),
+      state: readyStateName(ws),
+    });
   }
 
   if (type === 'join') {
@@ -273,13 +330,13 @@ function handleMessage(ws, session, msg) {
     if (!room) {
       room = new RoomRuntime(session.roomId, [], MIN_PLAYERS);
       rooms.set(session.roomId, room);
-      console.log(`[ROOM] Created room ${session.roomId} with minPlayers=${room.minPlayers}`);
+      diag(cid, 'room_created', { roomId: session.roomId, minPlayers: room.minPlayers });
     }
 
     // Idempotent join: same session reconnect/join retries should not duplicate state.
     if (room.sessions.has(session.sessionId)) {
       const waitingFor = Math.max(0, room.minPlayers - room.connectedUserIds.size);
-      ws.send(JSON.stringify({
+      sendJson(ws, cid, {
         type: 'joined',
         payload: {
           room_id: session.roomId,
@@ -287,13 +344,14 @@ function handleMessage(ws, session, msg) {
           player_ids: [...room.connectedUserIds],
           waiting_for: waitingFor,
         },
-      }));
+      }, 'joined(idempotent)');
+      diag(cid, 'join_idempotent', { waitingFor, connected: room.connectedUserIds.size });
       return;
     }
 
     room.addSession(session.sessionId, session.userId, ws);
     const waitingFor = Math.max(0, room.minPlayers - room.connectedUserIds.size);
-    ws.send(JSON.stringify({
+    sendJson(ws, cid, {
       type: 'joined',
       payload: {
         room_id: session.roomId,
@@ -301,7 +359,13 @@ function handleMessage(ws, session, msg) {
         player_ids: [...room.connectedUserIds],
         waiting_for: waitingFor,
       },
-    }));
+    }, 'joined');
+    diag(cid, 'join_accepted', {
+      roomId: session.roomId,
+      connectedUsers: room.connectedUserIds.size,
+      sessions: room.sessions.size,
+      waitingFor,
+    });
     room.broadcast('player_joined', {
       player_id: session.userId,
       player_ids: [...room.connectedUserIds],
@@ -331,26 +395,32 @@ function handleMessage(ws, session, msg) {
       topTs
     );
     if (!result.accepted) {
-      ws.send(JSON.stringify({ type: 'error', payload: { code: 'INPUT_REJECTED', ...result } }));
+      sendJson(ws, cid, { type: 'error', payload: { code: 'INPUT_REJECTED', ...result } }, 'input_rejected');
+      diag(cid, 'input_rejected', result);
+    } else if (WS_INPUT_TRACE && (inputPayload.turn !== 0 || inputPayload.thrust !== 0 || inputPayload.fire)) {
+      diag(cid, 'input_accepted', { seq: topSeq, queued: result.queued, inputType });
     }
   } else if (type === 'ping') {
     const room = rooms.get(session.roomId);
     if (!room) return;
-    ws.send(JSON.stringify({
+    sendJson(ws, cid, {
       type: 'pong',
       payload: {
         room_id: session.roomId,
         server_tick: room.serverTick,
         server_ts: Date.now(),
       },
-    }));
+    }, 'pong');
   } else if (type === 'leave') {
     const room = rooms.get(session.roomId);
     if (room) {
       room.removeSession(session.sessionId);
       room.broadcast('player_left', { player_id: session.userId });
     }
+    diag(cid, 'leave_requested', { sessionId: shortId(session.sessionId), roomId: shortId(session.roomId) });
     ws.close();
+  } else {
+    diag(cid, 'unknown_message_type', { type });
   }
 }
 
@@ -367,13 +437,26 @@ app.prepare().then(() => {
 
   // Manually handle upgrade requests - route game WS to our server, ignore Next.js internal WS
   server.on('upgrade', (request, socket, head) => {
+    const cid = `${Date.now().toString(36)}-${(++connectionSeq).toString(36)}`;
+    request.__cid = cid;
+
     // Avoid matching query strings; only skip actual Next.js upgrade paths.
     const reqUrl = new URL(request.url || '/', `http://localhost:${PORT}`);
     if (reqUrl.pathname.startsWith('/_next/')) {
+      diag(cid, 'upgrade_skip_next', { path: reqUrl.pathname });
       return;
     }
 
-    console.log(`[WS] Upgrade request: url=${request.url?.slice(0, 120)}`);
+    diag(cid, 'upgrade_request', {
+      url: request.url?.slice(0, 120),
+      path: reqUrl.pathname,
+      hasToken: !!reqUrl.searchParams.get('token'),
+      origin: request.headers.origin || '(none)',
+      ua: (request.headers['user-agent'] || '').slice(0, 120),
+      xff: request.headers['x-forwarded-for'] || '(none)',
+      via: request.headers.via || '(none)',
+      socketRemote: `${socket.remoteAddress || '(unknown)'}:${socket.remotePort || '(unknown)'}`,
+    });
 
     wss.handleUpgrade(request, socket, head, (ws) => {
       wss.emit('connection', ws, request);
@@ -381,6 +464,11 @@ app.prepare().then(() => {
   });
 
   wss.on('connection', (ws, req) => {
+    const cid = req.__cid || `${Date.now().toString(36)}-${(++connectionSeq).toString(36)}`;
+    const openedAt = Date.now();
+    let messageCount = 0;
+    let bytesIn = 0;
+    let queuedCount = 0;
 
     // Note: req.url includes the path, e.g., /?token=...
     const url = new URL(req.url, `http://localhost:${PORT}`);
@@ -389,19 +477,44 @@ app.prepare().then(() => {
     let session = { userId: null, roomId: null, sessionId: null };
     let pendingMessages = []; 
     let authComplete = false;
+    const authStartedAt = Date.now();
+
+    const tcp = ws._socket;
+    if (tcp) {
+      try {
+        tcp.setNoDelay(true);
+        tcp.setKeepAlive(true, 15000);
+      } catch {}
+      diag(cid, 'connection_open', {
+        remote: `${tcp.remoteAddress || '(unknown)'}:${tcp.remotePort || '(unknown)'}`,
+        local: `${tcp.localAddress || '(unknown)'}:${tcp.localPort || '(unknown)'}`,
+        encrypted: !!tcp.encrypted,
+        readyState: readyStateName(ws),
+      });
+      tcp.on('timeout', () => diag(cid, 'tcp_timeout'));
+      tcp.on('end', () => diag(cid, 'tcp_end'));
+      tcp.on('error', (err) => console.error(`[WS][${cid}] tcp_error`, err.message));
+      tcp.on('close', (hadError) => diag(cid, 'tcp_close', { hadError }));
+    } else {
+      diag(cid, 'connection_open', { note: 'no underlying tcp socket info', readyState: readyStateName(ws) });
+    }
 
     // Register message handler FIRST, before any async operations
     ws.on('message', (data) => {
+      messageCount += 1;
+      bytesIn += data.length || 0;
+      diag(cid, 'frame_in', { len: data.length || 0, count: messageCount, authComplete, state: readyStateName(ws) });
       try {
         const msg = JSON.parse(data.toString());
         if (!authComplete) {
-          console.log(`[WS] Queuing message (auth pending): type=${msg.type}`);
+          queuedCount += 1;
+          diag(cid, 'queue_pre_auth', { type: msg.type, queuedCount });
           pendingMessages.push(msg);
           return;
         }
-        handleMessage(ws, session, msg);
+        handleMessage(ws, session, msg, { cid });
       } catch (err) {
-        console.error('[WS] Message error:', err.message);
+        console.error(`[WS][${cid}] message_parse_error`, err.message);
       }
     });
 
@@ -414,17 +527,28 @@ app.prepare().then(() => {
           room.broadcast('player_left', { player_id: session.userId });
         }
       }
-      console.log(`[WS] Closed: code=${code} reason=${reason || '(none)'} user=${session.userId || '(unknown)'} room=${session.roomId || '(unknown)'}`);
+      diag(cid, 'closed', {
+        code,
+        reason: reason || '(none)',
+        user: session.userId || '(unknown)',
+        room: session.roomId || '(unknown)',
+        uptimeMs: Date.now() - openedAt,
+        framesIn: messageCount,
+        bytesIn,
+        queuedBeforeAuth: queuedCount,
+        activeRooms: rooms.size,
+        rssMb: Math.round(process.memoryUsage().rss / (1024 * 1024)),
+      });
     });
 
     ws.on('error', (err) => {
-      console.error('[WS] Socket error:', err.message);
+      console.error(`[WS][${cid}] ws_error`, err.message);
     });
 
-    console.log('[WS] Message handler registered, starting auth...');
+    diag(cid, 'auth_start', { hasToken: !!token });
 
     if (!token) {
-      ws.send(JSON.stringify({ type: 'error', payload: { code: 'NO_TOKEN', message: 'Missing access token' } }));
+      sendJson(ws, cid, { type: 'error', payload: { code: 'NO_TOKEN', message: 'Missing access token' } }, 'no_token');
       ws.close();
       return;
     }
@@ -438,28 +562,34 @@ app.prepare().then(() => {
         session.roomId = payload.room_id;
         session.sessionId = payload.session_id;
         authComplete = true;
-        console.log('[WS] Connection authenticated:', session);
+        diag(cid, 'auth_ok', {
+          authMs: Date.now() - authStartedAt,
+          userId: payload.sub,
+          roomId: payload.room_id,
+          sessionId: payload.session_id,
+          jti: payload.jti,
+          iat: payload.iat,
+          exp: payload.exp,
+          state: readyStateName(ws),
+        });
 
         // Send auth_ok only if the socket is still open.
-        if (ws.readyState === ws.OPEN) {
-          ws.send(JSON.stringify({ type: 'auth_ok', payload: { session_id: session.sessionId, room_id: session.roomId } }));
-          console.log('[WS] Sent auth_ok to client');
-        } else {
-          console.warn(`[WS] Skip auth_ok - socket not open (readyState=${ws.readyState})`);
+        if (!sendJson(ws, cid, { type: 'auth_ok', payload: { session_id: session.sessionId, room_id: session.roomId } }, 'auth_ok')) {
+          console.warn(`[WS][${cid}] skip_auth_ok_not_open`, { readyState: readyStateName(ws) });
           return;
         }
 
         if (pendingMessages.length > 0) {
-          console.log(`[WS] Processing ${pendingMessages.length} queued message(s)`);
+          diag(cid, 'process_queued', { count: pendingMessages.length });
           for (const msg of pendingMessages) {
-            handleMessage(ws, session, msg);
+            handleMessage(ws, session, msg, { cid });
           }
           pendingMessages = [];
         }
       })
       .catch((err) => {
-        console.error('[WS] Auth failed:', err.message);
-        ws.send(JSON.stringify({ type: 'error', payload: { code: 'INVALID_TOKEN', message: err.message } }));
+        console.error(`[WS][${cid}] auth_failed`, err.message);
+        sendJson(ws, cid, { type: 'error', payload: { code: 'INVALID_TOKEN', message: err.message } }, 'auth_failed');
         ws.close();
       });
   });
@@ -470,5 +600,6 @@ app.prepare().then(() => {
     console.log(`> WebSocket Server ready on ws://localhost:${PORT}`);
     console.log(`> Config: SERVICE_ID=${SERVICE_ID} API_URL=${API_URL} JWKS_URL=${JWKS_URL}`);
     console.log(`> NODE_ENV=${process.env.NODE_ENV || '(unset)'}`);
+    console.log(`> WS_DIAG=${WS_DIAG} WS_INPUT_TRACE=${WS_INPUT_TRACE}`);
   });
 });

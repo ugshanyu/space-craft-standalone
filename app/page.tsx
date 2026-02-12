@@ -262,6 +262,7 @@ export default function Page() {
 
       let lastErr: any = null;
       for (let attempt = 1; attempt <= JOIN_RETRY_LIMIT; attempt++) {
+        console.log("[Direct] connect/join attempt", { attempt, roomId: rid, userId: uid });
         try {
           try { usion.game.disconnect?.(); } catch {}
           await sleep(120);
@@ -280,11 +281,13 @@ export default function Page() {
           } else {
             setStatus("All players connected!");
           }
+          console.log("[Direct] connect/join success", { attempt, roomId: rid, waitingFor: waiting, playerCount: pids.length });
           lastErr = null;
           break;
         } catch (err: any) {
           lastErr = err;
           const msg = String(err?.message || err);
+          console.warn("[Direct] connect/join attempt failed", { attempt, roomId: rid, error: msg });
           try { usion.game.disconnect?.(); } catch {}
           if (!msg.includes("code=1006") || attempt === JOIN_RETRY_LIMIT) {
             throw err;
