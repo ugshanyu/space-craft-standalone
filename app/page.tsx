@@ -14,7 +14,7 @@ declare global {
 const WIDTH = 420;
 const HEIGHT = 420;
 const INPUT_INTERVAL_MS = 50;
-const JOIN_RETRY_LIMIT = 4;
+const JOIN_RETRY_LIMIT = Number(process.env.NEXT_PUBLIC_JOIN_RETRY_LIMIT || 4);
 const JOIN_RETRY_BACKOFF_MS = 700;
 
 export default function Page() {
