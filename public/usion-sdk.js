@@ -994,9 +994,12 @@
       },
 
       _sendDirect: function(type, payload) {
-        if (!this.directSocket || this.directSocket.readyState !== WebSocket.OPEN) return;
+        if (!this.directSocket || this.directSocket.readyState !== WebSocket.OPEN) {
+          console.log(`[SDK] _sendDirect FAILED: type=${type} socket_state=${this.directSocket ? this.directSocket.readyState : 'null'}`);
+          return;
+        }
         this._directSeq = this._directSeq + 1;
-        this.directSocket.send(JSON.stringify({
+        const msg = {
           type: type,
           room_id: this.roomId,
           ts: Date.now(),
@@ -1004,7 +1007,9 @@
           session_id: (this.directConfig && this.directConfig.session_id) ? this.directConfig.session_id : null,
           protocol_version: (this.directConfig && this.directConfig.protocol_version) ? this.directConfig.protocol_version : '2',
           payload: payload || {}
-        }));
+        };
+        console.log(`[SDK] _sendDirect: type=${type} seq=${this._directSeq}`, msg);
+        this.directSocket.send(JSON.stringify(msg));
       },
 
       _handleDirectMessage: function(raw) {
