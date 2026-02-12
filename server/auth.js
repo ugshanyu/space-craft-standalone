@@ -28,15 +28,7 @@ export async function validateAccessToken(token, {
   try {
     const decoded = decodeJwt(token);
     const now = Math.floor(Date.now() / 1000);
-    console.log('[AUTH] Token claims:', {
-      iss: decoded.iss,
-      aud: decoded.aud,
-      sub: decoded.sub,
-      iat: decoded.iat,
-      exp: decoded.exp,
-      service_id: decoded.service_id,
-      room_id: decoded.room_id,
-    });
+    console.log('[AUTH] Token claims:', decoded); // Log ALL claims
     console.log('[AUTH] Time check: now=', now, 'iat=', decoded.iat, 'exp=', decoded.exp,
       'iat_diff=', now - decoded.iat, 'exp_remaining=', decoded.exp - now);
   } catch (e) {
