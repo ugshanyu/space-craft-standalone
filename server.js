@@ -253,7 +253,11 @@ function handleMessage(ws, session, msg) {
         waiting_for: waitingFor,
       },
     }));
-    room.broadcast('player_joined', { player_id: session.userId, player_ids: [...room.connectedUserIds] });
+    room.broadcast('player_joined', {
+      player_id: session.userId,
+      player_ids: [...room.connectedUserIds],
+      waiting_for: waitingFor,
+    });
 
     if (!room.running && room.connectedUserIds.size >= room.minPlayers) {
       console.log(`[ROOM] All ${room.minPlayers} players connected, starting game in room ${session.roomId}`);

@@ -334,7 +334,11 @@ function handleMessage(ws, session, msg) {
         waiting_for: waitingFor,
       },
     }));
-    room.broadcast('player_joined', { player_id: session.userId, player_ids: [...room.connectedUserIds] });
+    room.broadcast('player_joined', {
+      player_id: session.userId,
+      player_ids: [...room.connectedUserIds],
+      waiting_for: waitingFor,
+    });
 
     // Start if enough unique players are now connected
     if (!room.running && room.connectedUserIds.size >= room.minPlayers) {

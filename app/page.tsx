@@ -183,7 +183,9 @@ export default function Page() {
         usion.game.onPlayerJoined((data: AnyObj) => {
           console.log("[Direct] Player joined:", data);
           const pids = data.player_ids || [];
-          const waiting = Number(data.waiting_for || 0);
+          const waiting = data.waiting_for !== undefined
+            ? Number(data.waiting_for || 0)
+            : Math.max(0, 2 - pids.length);
           setPlayerCount(pids.length);
           setWaitingFor(waiting);
           if (waiting > 0) {
