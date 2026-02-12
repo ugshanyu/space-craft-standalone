@@ -14,6 +14,8 @@ declare global {
 const WIDTH = 420;
 const HEIGHT = 420;
 const INPUT_INTERVAL_MS = 50;
+const JOIN_RETRY_LIMIT = 4;
+const JOIN_RETRY_BACKOFF_MS = 700;
 
 export default function Page() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -25,6 +27,7 @@ export default function Page() {
   const [playerCount, setPlayerCount] = useState(0);
   const [waitingFor, setWaitingFor] = useState(0);
   const [gameStarted, setGameStarted] = useState(false);
+  const [joining, setJoining] = useState(false);
   const worldRef = useRef<AnyObj | null>(null);
   const predictedRef = useRef<AnyObj | null>(null);
   const pendingInputsRef = useRef<InputEvent[]>([]);
@@ -32,6 +35,9 @@ export default function Page() {
   const seqRef = useRef(0);
   const lastAckRef = useRef(0);
   const inputTimerRef = useRef<number | null>(null);
+  const isConnectingRef = useRef(false);
+  const handlersBoundRef = useRef(false);
+  const activeRoomIdRef = useRef<string>("");
 
   useEffect(() => {
     const onInit = () => {
@@ -146,7 +152,13 @@ export default function Page() {
     for (const ev of pendingInputsRef.current) applyLocalPrediction(ev);
   }
 
+  async function sleep(ms: number): Promise<void> {
+    await new Promise((resolve) => window.setTimeout(resolve, ms));
+  }
+
   async function connectAndJoin() {
+    if (isConnectingRef.current) return;
+
     const usion = window.Usion;
     if (!usion?.game) {
       setStatus("SDK not ready");
@@ -158,122 +170,146 @@ export default function Page() {
       return;
     }
     setRoomId(rid);
+    activeRoomIdRef.current = rid;
     const uid = String(usion.user?.getId?.() || "");
     setMyId(uid);
     setStatus("Connecting to direct server...");
+    isConnectingRef.current = true;
+    setJoining(true);
 
     try {
-      // Setup event handlers before join so we don't miss immediate server events.
-      usion.game.onJoined((data: AnyObj) => {
-        console.log("[Direct] Joined:", data);
-        const pids = data.player_ids || [];
-        const waiting = Number(data.waiting_for || 0);
-        setJoined(true);
-        setPlayerCount(pids.length);
-        setWaitingFor(waiting);
-        if (waiting > 0) {
-          setStatus(`Waiting for ${waiting} more player(s)... (${pids.length}/2)`);
-        } else {
-          setStatus("All players connected!");
-        }
-      });
+      if (!handlersBoundRef.current) {
+        handlersBoundRef.current = true;
 
-      // Handle player_joined events (new player connected)
-      if (usion.game.onPlayerJoined) {
-        usion.game.onPlayerJoined((data: AnyObj) => {
-          console.log("[Direct] Player joined:", data);
+        // Setup event handlers once so reload retries do not stack duplicate listeners.
+        usion.game.onJoined((data: AnyObj) => {
+          if (data?.room_id && data.room_id !== activeRoomIdRef.current) return;
+          console.log("[Direct] Joined:", data);
           const pids = data.player_ids || [];
-          const waiting = data.waiting_for !== undefined
-            ? Number(data.waiting_for || 0)
-            : Math.max(0, 2 - pids.length);
+          const waiting = Number(data.waiting_for || 0);
+          setJoined(true);
           setPlayerCount(pids.length);
           setWaitingFor(waiting);
           if (waiting > 0) {
-            setStatus(`Player joined! Waiting for ${waiting} more... (${pids.length}/2)`);
+            setStatus(`Waiting for ${waiting} more player(s)... (${pids.length}/2)`);
           } else {
-            setStatus("All players connected! Starting...");
+            setStatus("All players connected!");
           }
+        });
+
+        if (usion.game.onPlayerJoined) {
+          usion.game.onPlayerJoined((data: AnyObj) => {
+            if (data?.room_id && data.room_id !== activeRoomIdRef.current) return;
+            console.log("[Direct] Player joined:", data);
+            const pids = data.player_ids || [];
+            const waiting = data.waiting_for !== undefined
+              ? Number(data.waiting_for || 0)
+              : Math.max(0, 2 - pids.length);
+            setPlayerCount(pids.length);
+            setWaitingFor(waiting);
+            if (waiting > 0) {
+              setStatus(`Player joined! Waiting for ${waiting} more... (${pids.length}/2)`);
+            } else {
+              setStatus("All players connected! Starting...");
+            }
+          });
+        }
+
+        usion.game.onGameStart((data: AnyObj) => {
+          if (data?.room_id && data.room_id !== activeRoomIdRef.current) return;
+          console.log("[Direct] Game started!", data);
+          setGameStarted(true);
+          setPlayerCount((data.player_ids || []).length);
+          setWaitingFor(0);
+          setStatus("Game started! Fight!");
+
+          if (inputTimerRef.current) window.clearInterval(inputTimerRef.current);
+          inputTimerRef.current = window.setInterval(() => {
+            const input = buildInputFromKeys();
+            pendingInputsRef.current.push(input);
+            applyLocalPrediction(input);
+            usion.game.realtime("control", input.payload);
+          }, INPUT_INTERVAL_MS);
+        });
+
+        usion.game.onRealtime((data: AnyObj) => {
+          if (data.room_id !== activeRoomIdRef.current) return;
+          if (data.protocol_version === "2") {
+            setGameStarted(true);
+            setServerTick(Number(data.server_tick || 0));
+            reconcileFromServer(data);
+          }
+        });
+
+        usion.game.onStateUpdate((data: AnyObj) => {
+          if (data.room_id !== activeRoomIdRef.current) return;
+          setGameStarted(true);
+          setServerTick(Number(data.server_tick || 0));
+          reconcileFromServer(data);
+        });
+
+        usion.game.onGameFinished((data: AnyObj) => {
+          if (data.room_id !== activeRoomIdRef.current) return;
+          setGameStarted(false);
+          setStatus(`Match ended (${data.reason || "completed"})`);
+        });
+
+        usion.game.onError((data: AnyObj) => {
+          if (data.room_id && data.room_id !== activeRoomIdRef.current) return;
+          setStatus(`Server error: ${data.code || "unknown"}`);
         });
       }
 
-      // Handle game_start event
-      usion.game.onGameStart((data: AnyObj) => {
-        console.log("[Direct] Game started!", data);
-        setGameStarted(true);
-        setPlayerCount((data.player_ids || []).length);
-        setWaitingFor(0);
-        setStatus("Game started! Fight!");
+      let lastErr: any = null;
+      for (let attempt = 1; attempt <= JOIN_RETRY_LIMIT; attempt++) {
+        try {
+          try { usion.game.disconnect?.(); } catch {}
+          await sleep(120);
+          await usion.game.connectDirect();
+          setStatus("Connected, joining room...");
+          const joinResp = await usion.game.join(rid);
+          if (joinResp?.error) throw new Error(joinResp.error);
 
-        // Start input loop when game actually starts
-        if (inputTimerRef.current) window.clearInterval(inputTimerRef.current);
-        inputTimerRef.current = window.setInterval(() => {
-          const input = buildInputFromKeys();
-          pendingInputsRef.current.push(input);
-          applyLocalPrediction(input);
-          usion.game.realtime('control', input.payload);
-        }, INPUT_INTERVAL_MS);
-      });
-
-      usion.game.onRealtime((data: AnyObj) => {
-        if (data.room_id !== rid) return;
-        if (data.protocol_version === '2') {
-          if (!gameStarted) setGameStarted(true);
-          setServerTick(Number(data.server_tick || 0));
-          reconcileFromServer(data);
+          setJoined(true);
+          const pids = joinResp?.player_ids || [];
+          const waiting = Number(joinResp?.waiting_for || 0);
+          setPlayerCount(pids.length);
+          setWaitingFor(waiting);
+          if (waiting > 0) {
+            setStatus(`Waiting for ${waiting} more player(s)... (${pids.length}/2)`);
+          } else {
+            setStatus("All players connected!");
+          }
+          lastErr = null;
+          break;
+        } catch (err: any) {
+          lastErr = err;
+          const msg = String(err?.message || err);
+          try { usion.game.disconnect?.(); } catch {}
+          if (!msg.includes("code=1006") || attempt === JOIN_RETRY_LIMIT) {
+            throw err;
+          }
+          setStatus(`Reconnecting... (${attempt}/${JOIN_RETRY_LIMIT})`);
+          await sleep(JOIN_RETRY_BACKOFF_MS * attempt);
         }
-      });
-
-      usion.game.onStateUpdate((data: AnyObj) => {
-        if (data.room_id !== rid) return;
-        setGameStarted(true);
-        setServerTick(Number(data.server_tick || 0));
-        reconcileFromServer(data);
-      });
-
-      usion.game.onGameFinished((data: AnyObj) => {
-        if (data.room_id !== rid) return;
-        setGameStarted(false);
-        setStatus(`Match ended (${data.reason || "completed"})`);
-      });
-
-      usion.game.onError((data: AnyObj) => {
-        if (data.room_id !== rid) return;
-        setStatus(`Server error: ${data.code || "unknown"}`);
-      });
-
-      // Direct Mode v2: SDK fetches access token and connects to ws_url
-      await usion.game.connectDirect();
-      setStatus("Connected, joining room...");
-
-      // Join the room
-      const joinResp = await usion.game.join(rid);
-      if (joinResp?.error) {
-        setStatus(`Join failed: ${joinResp.error}`);
-        return;
       }
-      setJoined(true);
-      if (joinResp) {
-        const pids = joinResp.player_ids || [];
-        const waiting = Number(joinResp.waiting_for || 0);
-        setPlayerCount(pids.length);
-        setWaitingFor(waiting);
-        if (waiting > 0) {
-          setStatus(`Waiting for ${waiting} more player(s)... (${pids.length}/2)`);
-        } else {
-          setStatus("All players connected!");
-        }
-      } else {
-        setStatus("Joined - waiting for game start");
-      }
+
+      if (lastErr) throw lastErr;
     } catch (err: any) {
       setStatus(`Connection failed: ${err.message || String(err)}`);
       console.error("[Direct] Connection error:", err);
+    } finally {
+      isConnectingRef.current = false;
+      setJoining(false);
     }
   }
 
   useEffect(() => {
     return () => {
       if (inputTimerRef.current) window.clearInterval(inputTimerRef.current);
+      try {
+        window.Usion?.game?.disconnect?.();
+      } catch {}
     };
   }, []);
 
@@ -306,9 +342,10 @@ export default function Page() {
         {!joined && (
           <button
             onClick={connectAndJoin}
+            disabled={joining}
             style={{ padding: "10px 12px", borderRadius: 8, border: "1px solid #334155", background: "#0f172a", color: "#e2e8f0" }}
           >
-            Connect + Join (Direct)
+            {joining ? "Connecting..." : "Connect + Join (Direct)"}
           </button>
         )}
         <div style={{ color: "#cbd5e1" }}>{status}</div>
