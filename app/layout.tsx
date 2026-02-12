@@ -8,10 +8,12 @@ export const metadata: Metadata = {
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {
+  const sdkVersion = process.env.RAILWAY_GIT_COMMIT_SHA?.slice(0, 8) || "v3";
+
   return (
     <html lang="en">
       <head>
-        <Script src="/usion-sdk.js" strategy="beforeInteractive" />
+        <Script src={`/usion-sdk.js?v=${sdkVersion}`} strategy="beforeInteractive" />
       </head>
       <body style={{ margin: 0, background: "#020617", color: "#e2e8f0", fontFamily: "system-ui, sans-serif" }}>
         {children}
