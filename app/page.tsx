@@ -163,24 +163,12 @@ export default function Page() {
     setStatus("Connecting to direct server...");
 
     try {
-      // Direct Mode v2: SDK fetches access token and connects to ws_url
-      await usion.game.connectDirect();
-      setStatus("Connected, joining room...");
-
-      // Join the room
-      const joinResp = await usion.game.join(rid);
-      if (joinResp?.error) {
-        setStatus(`Join failed: ${joinResp.error}`);
-        return;
-      }
-      setJoined(true);
-      setStatus("Joined - waiting for game start");
-
-      // Setup event handlers for Direct Mode v2
+      // Setup event handlers before join so we don't miss immediate server events.
       usion.game.onJoined((data: AnyObj) => {
         console.log("[Direct] Joined:", data);
         const pids = data.player_ids || [];
         const waiting = Number(data.waiting_for || 0);
+        setJoined(true);
         setPlayerCount(pids.length);
         setWaitingFor(waiting);
         if (waiting > 0) {
@@ -250,6 +238,31 @@ export default function Page() {
         if (data.room_id !== rid) return;
         setStatus(`Server error: ${data.code || "unknown"}`);
       });
+
+      // Direct Mode v2: SDK fetches access token and connects to ws_url
+      await usion.game.connectDirect();
+      setStatus("Connected, joining room...");
+
+      // Join the room
+      const joinResp = await usion.game.join(rid);
+      if (joinResp?.error) {
+        setStatus(`Join failed: ${joinResp.error}`);
+        return;
+      }
+      setJoined(true);
+      if (joinResp) {
+        const pids = joinResp.player_ids || [];
+        const waiting = Number(joinResp.waiting_for || 0);
+        setPlayerCount(pids.length);
+        setWaitingFor(waiting);
+        if (waiting > 0) {
+          setStatus(`Waiting for ${waiting} more player(s)... (${pids.length}/2)`);
+        } else {
+          setStatus("All players connected!");
+        }
+      } else {
+        setStatus("Joined - waiting for game start");
+      }
     } catch (err: any) {
       setStatus(`Connection failed: ${err.message || String(err)}`);
       console.error("[Direct] Connection error:", err);

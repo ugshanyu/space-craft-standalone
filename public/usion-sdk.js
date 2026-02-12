@@ -744,6 +744,10 @@
       _connectPromise: null,
       _joined: false,
       _joinPromise: null,
+      _lastJoinedPayload: null,
+      _directJoinResolve: null,
+      _directJoinReject: null,
+      _directJoinTimeout: null,
       _useProxy: false,
       _proxyListenerSetup: false,
 
@@ -980,6 +984,16 @@
             self.connected = false;
             self._joined = false;
             self._joinPromise = null;
+            self._lastJoinedPayload = null;
+            if (self._directJoinTimeout) {
+              clearTimeout(self._directJoinTimeout);
+              self._directJoinTimeout = null;
+            }
+            if (self._directJoinReject) {
+              self._directJoinReject(new Error('direct socket closed before join completed'));
+            }
+            self._directJoinResolve = null;
+            self._directJoinReject = null;
             if (self._eventHandlers.disconnect) {
               self._eventHandlers.disconnect(evt && evt.reason ? evt.reason : 'direct socket closed');
             }
@@ -1032,6 +1046,16 @@
 
         if (data.type === 'joined') {
           this._joined = true;
+          this._lastJoinedPayload = payload;
+          if (this._directJoinTimeout) {
+            clearTimeout(this._directJoinTimeout);
+            this._directJoinTimeout = null;
+          }
+          if (this._directJoinResolve) {
+            this._directJoinResolve(payload);
+            this._directJoinResolve = null;
+            this._directJoinReject = null;
+          }
           if (this._eventHandlers.joined) this._eventHandlers.joined(payload);
           return;
         }
@@ -1062,8 +1086,17 @@
           if (this._eventHandlers.finished) this._eventHandlers.finished(payload);
           return;
         }
-        if (data.type === 'error' && this._eventHandlers.error) {
-          this._eventHandlers.error(payload);
+        if (data.type === 'error') {
+          if (this._directJoinTimeout) {
+            clearTimeout(this._directJoinTimeout);
+            this._directJoinTimeout = null;
+          }
+          if (this._directJoinReject) {
+            this._directJoinReject(new Error(payload && (payload.message || payload.code) ? (payload.message || payload.code) : 'Direct join failed'));
+            this._directJoinResolve = null;
+            this._directJoinReject = null;
+          }
+          if (this._eventHandlers.error) this._eventHandlers.error(payload);
         }
       },
 
@@ -1397,10 +1430,37 @@
         self.playerId = Usion.user.getId();
 
         if (self.directMode) {
-          self._joined = true;
-          self._joinPromise = Promise.resolve({
-            room_id: roomId,
-            player_id: self.playerId
+          if (!self.directSocket || self.directSocket.readyState !== WebSocket.OPEN || !self.connected) {
+            return Promise.reject(new Error('Not connected'));
+          }
+
+          if (self._joined && self.roomId === roomId && self._lastJoinedPayload) {
+            self._joinPromise = Promise.resolve(self._lastJoinedPayload);
+            return self._joinPromise;
+          }
+
+          self._joinPromise = new Promise(function(resolve, reject) {
+            self._directJoinResolve = function(payload) {
+              resolve(payload || {
+                room_id: roomId,
+                player_id: self.playerId
+              });
+            };
+            self._directJoinReject = function(err) {
+              self._joined = false;
+              self._joinPromise = null;
+              reject(err);
+            };
+            if (self._directJoinTimeout) clearTimeout(self._directJoinTimeout);
+            self._directJoinTimeout = setTimeout(function() {
+              self._directJoinTimeout = null;
+              if (self._directJoinReject) {
+                self._directJoinReject(new Error('Join timeout'));
+                self._directJoinResolve = null;
+                self._directJoinReject = null;
+              }
+            }, 15000);
+            if (!self._joined) self._sendDirect('join', {});
           });
           return self._joinPromise;
         }
@@ -1461,6 +1521,13 @@
           self._lastSequence = 0;
           self._joined = false;
           self._joinPromise = null;
+          self._lastJoinedPayload = null;
+          if (self._directJoinTimeout) {
+            clearTimeout(self._directJoinTimeout);
+            self._directJoinTimeout = null;
+          }
+          self._directJoinResolve = null;
+          self._directJoinReject = null;
           return;
         }
         
@@ -1655,6 +1722,13 @@
           self._connectPromise = null;
           self._joined = false;
           self._joinPromise = null;
+          self._lastJoinedPayload = null;
+          if (self._directJoinTimeout) {
+            clearTimeout(self._directJoinTimeout);
+            self._directJoinTimeout = null;
+          }
+          self._directJoinResolve = null;
+          self._directJoinReject = null;
           self.directMode = false;
           self.directConfig = null;
           self._directSeq = 0;
