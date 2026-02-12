@@ -71,10 +71,57 @@ class RoomRuntime {
   }
 
   removeSession(sessionId) {
+    const removed = this.sessions.get(sessionId);
     this.sessions.delete(sessionId);
-    if (this.sessions.size === 0 && this.finished) {
+
+    if (removed) {
+      const stillConnected = [...this.sessions.values()].some((s) => s.userId === removed.userId);
+      if (!stillConnected) {
+        this.connectedUserIds.delete(removed.userId);
+        delete this.ackSeqByPlayer[removed.userId];
+      }
+    }
+
+    // If a running match loses a participant, end and clean up room state.
+    if (this.running && !this.finished && this.sessions.size < this.minPlayers) {
+      this.finished = true;
+      const finalStats = {};
+      if (this.state?.players) {
+        for (const [pid, p] of Object.entries(this.state.players)) {
+          finalStats[pid] = p.stats;
+        }
+      }
+      const survivors = [...new Set([...this.sessions.values()].map((s) => s.userId))];
+      this.broadcast('match_end', {
+        room_id: this.roomId,
+        protocol_version: '2',
+        server_ts: Date.now(),
+        server_tick: this.serverTick,
+        winner_ids: survivors,
+        reason: 'player_disconnected',
+        final_stats: finalStats,
+      });
       this.stop();
+
+      // Close surviving sockets and drop the room immediately.
+      for (const { ws } of this.sessions.values()) {
+        try { ws.close(4001, 'player_disconnected'); } catch {}
+      }
+      this.sessions.clear();
+      this.connectedUserIds.clear();
+      this.inputQueue = [];
       rooms.delete(this.roomId);
+      console.log(`[ROOM] Closed room due to player disconnect: ${this.roomId}`);
+      return;
+    }
+
+    // Always destroy empty rooms to avoid leaked tick loops and stale state.
+    if (this.sessions.size === 0) {
+      this.stop();
+      this.connectedUserIds.clear();
+      this.inputQueue = [];
+      rooms.delete(this.roomId);
+      console.log(`[ROOM] Removed empty room: ${this.roomId}`);
     }
   }
 
@@ -217,7 +264,9 @@ function handleMessage(ws, session, msg) {
   const topSeq = msg.seq || 0;
   const topTs = msg.ts || Date.now();
 
-  console.log(`[MSG] type=${type} user=${session.userId?.slice(0,8)} room=${session.roomId?.slice(0,8)}`);
+  if (type !== 'input') {
+    console.log(`[MSG] type=${type} user=${session.userId?.slice(0,8)} room=${session.roomId?.slice(0,8)}`);
+  }
 
   if (type === 'join') {
     let room = rooms.get(session.roomId);
@@ -343,7 +392,6 @@ app.prepare().then(() => {
 
     // Register message handler FIRST, before any async operations
     ws.on('message', (data) => {
-      console.log(`[WS] RAW message received from user=${session.userId?.slice(0,8) || '(pending)'}, length=${data.length}`);
       try {
         const msg = JSON.parse(data.toString());
         if (!authComplete) {
