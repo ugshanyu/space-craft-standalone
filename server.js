@@ -340,14 +340,13 @@ app.prepare().then(() => {
 
   // Manually handle upgrade requests - route game WS to our server, ignore Next.js internal WS
   server.on('upgrade', (request, socket, head) => {
-    // Let Next.js handle its own WebSocket connections (HMR, etc.)
-    if (request.url?.includes('_next')) {
-      // Don't handle - let it fall through or destroy
-      socket.destroy();
+    // Avoid matching query strings; only skip actual Next.js upgrade paths.
+    const reqUrl = new URL(request.url || '/', `http://localhost:${PORT}`);
+    if (reqUrl.pathname.startsWith('/_next/')) {
       return;
     }
 
-    console.log(`[WS] Upgrade request: url=${request.url?.slice(0, 80)}`);
+    console.log(`[WS] Upgrade request: url=${request.url?.slice(0, 120)}`);
 
     wss.handleUpgrade(request, socket, head, (ws) => {
       wss.emit('connection', ws, request);
@@ -380,7 +379,8 @@ app.prepare().then(() => {
       }
     });
 
-    ws.on('close', () => {
+    ws.on('close', (code, reasonBuf) => {
+      const reason = reasonBuf ? reasonBuf.toString() : '';
       if (session.roomId && session.sessionId) {
         const room = rooms.get(session.roomId);
         if (room) {
@@ -388,26 +388,12 @@ app.prepare().then(() => {
           room.broadcast('player_left', { player_id: session.userId });
         }
       }
-    });
-
-    // Diagnostic: test raw socket and ping/pong
-    console.log(`[WS] Socket state: readyState=${ws.readyState} bufferedAmount=${ws.bufferedAmount}`);
-    
-    ws.on('pong', (data) => {
-      console.log('[WS] PONG received:', data.toString());
+      console.log(`[WS] Closed: code=${code} reason=${reason || '(none)'} user=${session.userId || '(unknown)'} room=${session.roomId || '(unknown)'}`);
     });
 
     ws.on('error', (err) => {
       console.error('[WS] Socket error:', err.message);
     });
-
-    // Send a ping to test the connection
-    try {
-      ws.ping('hello');
-      console.log('[WS] Ping sent');
-    } catch(e) {
-      console.error('[WS] Ping failed:', e.message);
-    }
 
     console.log('[WS] Message handler registered, starting auth...');
 

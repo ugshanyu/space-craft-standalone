@@ -990,7 +990,9 @@
               self._directJoinTimeout = null;
             }
             if (self._directJoinReject) {
-              self._directJoinReject(new Error('direct socket closed before join completed'));
+              var code = evt && evt.code !== undefined ? evt.code : 'unknown';
+              var reason = evt && evt.reason ? evt.reason : '';
+              self._directJoinReject(new Error('direct socket closed before join completed (code=' + code + (reason ? ', reason=' + reason : '') + ')'));
             }
             self._directJoinResolve = null;
             self._directJoinReject = null;
