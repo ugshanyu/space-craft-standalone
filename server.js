@@ -386,6 +386,7 @@ app.prepare().then(() => {
       });
 
     ws.on('message', (data) => {
+      console.log(`[WS] RAW message received, length=${data.length}`);
       try {
         const msg = JSON.parse(data.toString());
         if (!authComplete) {
