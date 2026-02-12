@@ -335,8 +335,10 @@ app.prepare().then(() => {
     handle(req, res, parsedUrl);
   });
 
-  // Use noServer mode to avoid conflicts with Next.js WebSocket handling
-  const wss = new WebSocketServer({ noServer: true });
+  // Use noServer mode to avoid conflicts with Next.js WebSocket handling.
+  // Disable permessage-deflate to avoid proxy/transport edge cases that can
+  // cause abnormal close(1006) before first client message is processed.
+  const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
 
   // Manually handle upgrade requests - route game WS to our server, ignore Next.js internal WS
   server.on('upgrade', (request, socket, head) => {
@@ -414,9 +416,14 @@ app.prepare().then(() => {
         authComplete = true;
         console.log('[WS] Connection authenticated:', session);
 
-        // Send auth_ok to client so it knows auth succeeded and can send join
-        ws.send(JSON.stringify({ type: 'auth_ok', payload: { session_id: session.sessionId, room_id: session.roomId } }));
-        console.log('[WS] Sent auth_ok to client');
+        // Send auth_ok only if the socket is still open.
+        if (ws.readyState === ws.OPEN) {
+          ws.send(JSON.stringify({ type: 'auth_ok', payload: { session_id: session.sessionId, room_id: session.roomId } }));
+          console.log('[WS] Sent auth_ok to client');
+        } else {
+          console.warn(`[WS] Skip auth_ok - socket not open (readyState=${ws.readyState})`);
+          return;
+        }
 
         if (pendingMessages.length > 0) {
           console.log(`[WS] Processing ${pendingMessages.length} queued message(s)`);

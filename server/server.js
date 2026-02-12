@@ -199,7 +199,7 @@ function hashState(state) {
 }
 
 // WebSocket Server
-const wss = new WebSocketServer({ port: PORT });
+const wss = new WebSocketServer({ port: PORT, perMessageDeflate: false });
 
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url, `ws://localhost:${PORT}`);
