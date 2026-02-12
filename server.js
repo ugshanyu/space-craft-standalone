@@ -189,17 +189,24 @@ function hashState(state) {
 }
 
 async function fetchRoomInfo(roomId) {
+  console.log(`[ROOM] Fetching room info for ${roomId} from ${API_URL}...`);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000); // 5s timeout
   try {
     const resp = await fetch(`${API_URL}/games/rooms/${encodeURIComponent(roomId)}`, {
       headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
     });
+    clearTimeout(timeout);
     if (!resp.ok) {
-      console.log(`[ROOM] Failed to fetch room info (${resp.status}), using single-player fallback`);
+      console.log(`[ROOM] Failed to fetch room info (${resp.status}), using fallback`);
       return null;
     }
     const data = await resp.json();
+    console.log(`[ROOM] Got room info:`, { playerCount: data.player_ids?.length, status: data.status });
     return data;
   } catch (err) {
+    clearTimeout(timeout);
     console.error('[ROOM] Error fetching room info:', err.message);
     return null;
   }
@@ -209,6 +216,8 @@ function handleMessage(ws, session, msg) {
   const { type, payload } = msg;
   const topSeq = msg.seq || 0;
   const topTs = msg.ts || Date.now();
+
+  console.log(`[MSG] type=${type} user=${session.userId?.slice(0,8)} room=${session.roomId?.slice(0,8)}`);
 
   if (type === 'join') {
     let room = rooms.get(session.roomId);
@@ -380,6 +389,7 @@ app.prepare().then(() => {
       try {
         const msg = JSON.parse(data.toString());
         if (!authComplete) {
+          console.log(`[WS] Queuing message (auth pending): type=${msg.type}`);
           pendingMessages.push(msg);
           return;
         }
@@ -404,5 +414,7 @@ app.prepare().then(() => {
     if (err) throw err;
     console.log(`> Ready on http://localhost:${PORT}`);
     console.log(`> WebSocket Server ready on ws://localhost:${PORT}`);
+    console.log(`> Config: SERVICE_ID=${SERVICE_ID} API_URL=${API_URL} JWKS_URL=${JWKS_URL}`);
+    console.log(`> NODE_ENV=${process.env.NODE_ENV || '(unset)'}`);
   });
 });

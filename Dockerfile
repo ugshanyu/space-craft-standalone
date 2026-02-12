@@ -11,7 +11,8 @@ RUN npm install
 # Copy source code
 COPY . .
 
-# Build Next.js app
+# Build Next.js app in production mode
+ENV NODE_ENV=production
 RUN npm run build
 
 # Remove dev dependencies
@@ -21,5 +22,5 @@ RUN npm prune --production
 ENV PORT=8080
 EXPOSE 8080
 
-# Start the custom server
+# Start the custom server (production mode)
 CMD ["node", "server.js"]
