@@ -309,10 +309,43 @@ export default function Page() {
 
   useEffect(() => {
     return () => {
+      console.log("[Direct] page unmount cleanup");
       if (inputTimerRef.current) window.clearInterval(inputTimerRef.current);
       try {
         window.Usion?.game?.disconnect?.();
       } catch {}
+    };
+  }, []);
+
+  useEffect(() => {
+    const onVisibility = () => {
+      console.log("[Direct] visibilitychange", { state: document.visibilityState, ts: Date.now() });
+    };
+    const onPageHide = (e: PageTransitionEvent) => {
+      console.log("[Direct] pagehide", { persisted: e.persisted, ts: Date.now() });
+    };
+    const onBeforeUnload = () => {
+      console.log("[Direct] beforeunload", { ts: Date.now() });
+    };
+    const onOnline = () => {
+      console.log("[Direct] online", { ts: Date.now() });
+    };
+    const onOffline = () => {
+      console.log("[Direct] offline", { ts: Date.now() });
+    };
+
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("pagehide", onPageHide);
+    window.addEventListener("beforeunload", onBeforeUnload);
+    window.addEventListener("online", onOnline);
+    window.addEventListener("offline", onOffline);
+
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("pagehide", onPageHide);
+      window.removeEventListener("beforeunload", onBeforeUnload);
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("offline", onOffline);
     };
   }, []);
 
