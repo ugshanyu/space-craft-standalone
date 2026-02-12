@@ -386,7 +386,7 @@ app.prepare().then(() => {
       });
 
     ws.on('message', (data) => {
-      console.log(`[WS] RAW message received, length=${data.length}`);
+      console.log(`[WS] RAW message received from user=${session.userId?.slice(0,8) || '(pending)'}, length=${data.length}`);
       try {
         const msg = JSON.parse(data.toString());
         if (!authComplete) {
@@ -399,6 +399,8 @@ app.prepare().then(() => {
         console.error('[WS] Message error:', err.message);
       }
     });
+
+    console.log('[WS] Message handler registered, starting auth...');
 
     ws.on('close', () => {
       if (session.roomId && session.sessionId) {
