@@ -42,7 +42,13 @@ type SnapshotFrame = {
   state: WorldState;
 };
 
-type InputPayload = { turn: number; thrust: number; fire: boolean };
+type InputPayload = {
+  turn: number;
+  thrust: number;
+  fire: boolean;
+  fire_pressed?: boolean;
+  client_sent_at_ms?: number;
+};
 type PendingInput = { transportSeq: number; payload: InputPayload; dtSec: number };
 
 declare global {
@@ -416,6 +422,7 @@ export default function Page() {
   const predictedProjectileSeqRef = useRef(0);
   const lastInputSentAtRef = useRef(0);
   const lastImmediateInputSentAtRef = useRef(0);
+  const lastSentFireRef = useRef(false);
   const joinedRef = useRef(false);
   const gameStartedRef = useRef(false);
   const sendImmediateInputRef = useRef<() => void>(() => {});
@@ -429,7 +436,14 @@ export default function Page() {
   }, []);
 
   function sendControlInput(usion: AnyObj, input: InputPayload, sentAtMs = performance.now()) {
-    usion.game.realtime("control", input);
+    const isFirePressed = Boolean(input.fire && !lastSentFireRef.current);
+    lastSentFireRef.current = Boolean(input.fire);
+    const inputWithTiming: InputPayload = {
+      ...input,
+      fire_pressed: isFirePressed,
+      client_sent_at_ms: Date.now(),
+    };
+    usion.game.realtime("control", inputWithTiming);
 
     const prevSentAt = lastInputSentAtRef.current || sentAtMs - INPUT_SEND_MS;
     const dtSec = clamp((sentAtMs - prevSentAt) / 1000, 1 / 240, 0.12);
@@ -437,7 +451,7 @@ export default function Page() {
 
     const transportSeq = Number(usion?.game?._directSeq || 0);
     if (transportSeq > 0) {
-      pendingInputsRef.current.push({ transportSeq, payload: input, dtSec });
+      pendingInputsRef.current.push({ transportSeq, payload: inputWithTiming, dtSec });
       if (pendingInputsRef.current.length > MAX_PENDING_INPUTS) {
         pendingInputsRef.current.splice(0, pendingInputsRef.current.length - MAX_PENDING_INPUTS);
       }
@@ -517,6 +531,7 @@ export default function Page() {
     const onBlur = () => {
       const hadInput = keysRef.current.up || keysRef.current.down || keysRef.current.left || keysRef.current.right || keysRef.current.fire;
       keysRef.current = { up: false, down: false, left: false, right: false, fire: false };
+      lastSentFireRef.current = false;
       if (hadInput) sendImmediateInputRef.current();
     };
 
@@ -550,6 +565,7 @@ export default function Page() {
 
     if (gameStarted && joined && !inputTimerRef.current) {
       lastInputSentAtRef.current = performance.now() - INPUT_SEND_MS;
+      lastSentFireRef.current = false;
       inputTimerRef.current = window.setInterval(() => {
         const input = buildInputFromKeys(keysRef.current);
         sendControlInput(usion, input);
@@ -570,6 +586,7 @@ export default function Page() {
       pendingInputsRef.current = [];
       localFireCooldownMsRef.current = 0;
       lastRenderAtRef.current = null;
+      lastSentFireRef.current = false;
       try { window.Usion?.game?.disconnect?.(); } catch {}
     };
   }, []);
@@ -760,6 +777,7 @@ export default function Page() {
     predictedProjectileSeqRef.current = 0;
     localFireCooldownMsRef.current = 0;
     lastRenderAtRef.current = null;
+    lastSentFireRef.current = false;
 
     const uid = String(usion.user?.getId?.() || "");
     myIdRef.current = uid;
@@ -783,6 +801,7 @@ export default function Page() {
           lastNetworkTickRef.current = 0;
           lastInputSentAtRef.current = performance.now() - INPUT_SEND_MS;
           localFireCooldownMsRef.current = 0;
+          lastSentFireRef.current = false;
           setJoined(true);
           setPlayerCount((data?.player_ids || []).length);
           const waiting = Number(data?.waiting_for || 0);
@@ -801,6 +820,7 @@ export default function Page() {
           lastInputSentAtRef.current = performance.now() - INPUT_SEND_MS;
           localFireCooldownMsRef.current = 0;
           predictedProjectilesRef.current = [];
+          lastSentFireRef.current = false;
           setGameStarted(true);
           setStatus("Fight");
         });
@@ -814,6 +834,7 @@ export default function Page() {
           pendingInputsRef.current = [];
           predictedProjectilesRef.current = [];
           localFireCooldownMsRef.current = 0;
+          lastSentFireRef.current = false;
           setGameStarted(false);
           setStatus(`Match ended (${data?.reason || "done"})`);
         });
@@ -844,6 +865,7 @@ export default function Page() {
           predictedProjectileSeqRef.current = 0;
           localFireCooldownMsRef.current = 0;
           lastInputSentAtRef.current = performance.now() - INPUT_SEND_MS;
+          lastSentFireRef.current = false;
           setJoined(true);
           setPlayerCount((joinRes?.player_ids || []).length);
           const waiting = Number(joinRes?.waiting_for || 0);

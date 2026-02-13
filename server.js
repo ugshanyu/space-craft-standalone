@@ -23,6 +23,8 @@ const SIM_TICK_HZ = 60;
 const SIM_TICK_MS = Math.floor(1000 / SIM_TICK_HZ);
 const SNAPSHOT_HZ = 20;
 const SNAPSHOT_EVERY_TICKS = Math.max(1, Math.floor(SIM_TICK_HZ / SNAPSHOT_HZ));
+const MAX_LAG_COMP_MS = 120;
+const MAX_CLIENT_INPUT_AGE_MS = 2000;
 
 const rooms = new Map();
 
@@ -63,6 +65,7 @@ class RoomRuntime {
     this.latestInputByUser = new Map(); // userId -> payload
     this.lastSeqByUser = {}; // monotonic validation
     this.ackSeqByPlayer = {};
+    this.smoothedLagByUser = {};
     this.lastBroadcastState = null;
   }
 
@@ -78,7 +81,7 @@ class RoomRuntime {
     this.lastSeqByUser[userId] = 0;
     this.ackSeqByPlayer[userId] = 0;
     if (!this.latestInputByUser.has(userId)) {
-      this.latestInputByUser.set(userId, { turn: 0, thrust: 0, fire: false });
+      this.latestInputByUser.set(userId, { turn: 0, thrust: 0, fire: false, fire_pressed: false, lag_comp_ms: 0 });
     }
   }
 
@@ -92,6 +95,7 @@ class RoomRuntime {
         this.connectedUserIds.delete(removed.userId);
         delete this.lastSeqByUser[removed.userId];
         delete this.ackSeqByPlayer[removed.userId];
+        delete this.smoothedLagByUser[removed.userId];
         this.latestInputByUser.delete(removed.userId);
       }
     }
@@ -132,10 +136,25 @@ class RoomRuntime {
 
     this.lastSeqByUser[userId] = safeSeq;
     this.ackSeqByPlayer[userId] = safeSeq;
+
+    const now = Date.now();
+    const clientSentAtMs = Number(payload?.client_sent_at_ms || 0);
+    let lagCompMs = Number(this.smoothedLagByUser[userId] || 0);
+    if (clientSentAtMs > 0) {
+      const ageMs = now - clientSentAtMs;
+      if (ageMs >= 0 && ageMs <= MAX_CLIENT_INPUT_AGE_MS) {
+        const prev = Number(this.smoothedLagByUser[userId] || ageMs);
+        lagCompMs = Math.max(0, Math.min(MAX_LAG_COMP_MS, prev * 0.8 + ageMs * 0.2));
+        this.smoothedLagByUser[userId] = lagCompMs;
+      }
+    }
+
     this.latestInputByUser.set(userId, {
       turn: Number(payload?.turn || 0),
       thrust: Number(payload?.thrust || 0),
       fire: Boolean(payload?.fire),
+      fire_pressed: Boolean(payload?.fire_pressed),
+      lag_comp_ms: lagCompMs,
     });
     return { accepted: true };
   }
@@ -173,6 +192,9 @@ class RoomRuntime {
 
     for (const [pid, input] of this.latestInputByUser.entries()) {
       Game.applyInput(this.state, pid, input);
+      if (input && input.fire_pressed) {
+        input.fire_pressed = false;
+      }
     }
 
     Game.tick(this.state, SIM_TICK_MS);
@@ -261,7 +283,7 @@ function cloneState(state) {
   for (const [pid, p] of Object.entries(state.players || {})) {
     players[pid] = {
       ...p,
-      input: p.input ? { ...p.input } : { turn: 0, thrust: 0, fire: false },
+      input: p.input ? { ...p.input } : { turn: 0, thrust: 0, fire: false, firePressed: false, lagCompMs: 0 },
       stats: p.stats ? { ...p.stats } : { kills: 0, deaths: 0, damageDealt: 0, pickups: 0 },
     };
   }

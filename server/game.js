@@ -20,6 +20,7 @@ export const CONFIG = {
   projectileTtlMs: 1100,
   projectileDamage: 20,
   fireCooldownMs: 180,
+  maxLagCompensationMs: 120,
 
   maxHp: 100,
   maxShield: 60,
@@ -57,7 +58,7 @@ export function initState(playerIds, seed) {
       weaponLevel: 1,
       fireCooldownMs: 0,
       alive: true,
-      input: { turn: 0, thrust: 0, fire: false },
+      input: { turn: 0, thrust: 0, fire: false, firePressed: false, lagCompMs: 0 },
       stats: {
         kills: 0,
         deaths: 0,
@@ -91,6 +92,8 @@ export function applyInput(state, playerId, payload) {
     turn: clamp(Number(payload?.turn || 0), -1, 1),
     thrust: clamp(Number(payload?.thrust || 0), -1, 1),
     fire: Boolean(payload?.fire),
+    firePressed: Boolean(payload?.fire_pressed),
+    lagCompMs: clamp(Number(payload?.lag_comp_ms || 0), 0, CONFIG.maxLagCompensationMs),
   };
 }
 
@@ -133,9 +136,11 @@ export function tick(state, dtMs) {
     p.shield = Math.min(CONFIG.maxShield, p.shield + CONFIG.shieldRegenPerSecond * dt);
 
     if (p.input.fire && p.fireCooldownMs <= 0) {
-      spawnProjectile(state, pid, p);
+      const lagCompMs = p.input.firePressed ? p.input.lagCompMs : 0;
+      spawnProjectile(state, pid, p, lagCompMs);
       p.fireCooldownMs = CONFIG.fireCooldownMs;
     }
+    p.input.firePressed = false;
   }
 
   updateProjectiles(state, dtMs);
@@ -156,9 +161,9 @@ export function isTerminal(state) {
   };
 }
 
-function spawnProjectile(state, ownerId, p) {
+function spawnProjectile(state, ownerId, p, lagCompMs = 0) {
   const muzzle = 2.0;
-  state.projectiles.push({
+  const pr = {
     id: `${state.tick}:${ownerId}:${Math.random().toString(36).slice(2, 7)}`,
     ownerId,
     x: wrap(p.x + Math.cos(p.angle) * muzzle, state.arena.width),
@@ -167,7 +172,17 @@ function spawnProjectile(state, ownerId, p) {
     vy: Math.sin(p.angle) * CONFIG.projectileSpeed,
     ttlMs: CONFIG.projectileTtlMs,
     damage: CONFIG.projectileDamage + (p.weaponLevel - 1) * 3,
-  });
+  };
+
+  const appliedLagMs = clamp(Number(lagCompMs || 0), 0, CONFIG.maxLagCompensationMs);
+  if (appliedLagMs > 0) {
+    const lagDt = appliedLagMs / 1000;
+    pr.x = wrap(pr.x + pr.vx * lagDt, state.arena.width);
+    pr.y = wrap(pr.y + pr.vy * lagDt, state.arena.height);
+    pr.ttlMs = Math.max(0, pr.ttlMs - appliedLagMs);
+  }
+
+  state.projectiles.push(pr);
 }
 
 function updateProjectiles(state, dtMs) {
