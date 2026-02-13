@@ -25,6 +25,7 @@ const MIN_PLAYERS = 2;
 const WS_DIAG = process.env.WS_DIAG !== '0';
 const WS_INPUT_TRACE = process.env.WS_INPUT_TRACE === '1';
 const WS_DEBUG_PROBE = process.env.WS_DEBUG_PROBE === '1';
+const WS_PROBE_GAME = process.env.WS_PROBE_GAME === '1';
 const READY_STATE = ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'];
 let connectionSeq = 0;
 
@@ -436,6 +437,7 @@ app.prepare().then(() => {
   // cause abnormal close(1006) before first client message is processed.
   const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
   const debugWss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+  const probeGameWss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
 
   // Manually handle upgrade requests - route game WS to our server, ignore Next.js internal WS
   server.on('upgrade', (request, socket, head) => {
@@ -461,6 +463,22 @@ app.prepare().then(() => {
       });
       debugWss.handleUpgrade(request, socket, head, (ws) => {
         debugWss.emit('connection', ws, request);
+      });
+      return;
+    }
+
+    if (reqUrl.pathname === '/probe-game') {
+      if (!WS_PROBE_GAME) {
+        socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      diag(cid, 'upgrade_probe_game', {
+        url: request.url?.slice(0, 120),
+        origin: request.headers.origin || '(none)',
+      });
+      probeGameWss.handleUpgrade(request, socket, head, (ws) => {
+        probeGameWss.emit('connection', ws, request);
       });
       return;
     }
@@ -547,6 +565,73 @@ app.prepare().then(() => {
 
     ws.on('error', (err) => {
       console.error(`[WS][${cid}] debug_ws_error`, err.message);
+    });
+  });
+
+  probeGameWss.on('connection', (ws, req) => {
+    const cid = req.__cid || `${Date.now().toString(36)}-${(++connectionSeq).toString(36)}`;
+    const openedAt = Date.now();
+    const reqUrl = new URL(req.url || '/', `http://localhost:${PORT}`);
+    let joined = false;
+
+    diag(cid, 'probe_game_open', {
+      path: reqUrl.pathname,
+      readyState: readyStateName(ws),
+    });
+
+    sendJson(ws, cid, {
+      type: 'probe_ready',
+      payload: { ts: Date.now(), note: 'send {type:join,...} then expect probe_joined' },
+    }, 'probe_ready');
+
+    ws.on('message', (data) => {
+      let msg = null;
+      try {
+        msg = JSON.parse(data.toString());
+      } catch {
+        sendJson(ws, cid, {
+          type: 'probe_echo_raw',
+          payload: { ts: Date.now(), text: data.toString() },
+        }, 'probe_echo_raw');
+        return;
+      }
+
+      if (msg?.type === 'join') {
+        joined = true;
+        sendJson(ws, cid, {
+          type: 'probe_joined',
+          payload: {
+            room_id: msg.room_id || 'probe-room',
+            player_id: msg.session_id || 'probe-session',
+            player_ids: [msg.session_id || 'probe-session'],
+            waiting_for: 1,
+            ts: Date.now(),
+          },
+        }, 'probe_joined');
+        return;
+      }
+
+      if (msg?.type === 'ping') {
+        sendJson(ws, cid, {
+          type: 'pong',
+          payload: { ts: Date.now(), room_id: msg.room_id || 'probe-room', server_tick: 0 },
+        }, 'probe_pong');
+        return;
+      }
+
+      sendJson(ws, cid, {
+        type: 'probe_echo_json',
+        payload: { ts: Date.now(), received: msg, joined },
+      }, 'probe_echo_json');
+    });
+
+    ws.on('close', (code, reasonBuf) => {
+      diag(cid, 'probe_game_closed', {
+        code,
+        reason: reasonBuf ? reasonBuf.toString() : '(none)',
+        joined,
+        uptimeMs: Date.now() - openedAt,
+      });
     });
   });
 
@@ -690,5 +775,6 @@ app.prepare().then(() => {
     console.log(`> NODE_ENV=${process.env.NODE_ENV || '(unset)'}`);
     console.log(`> WS_DIAG=${WS_DIAG} WS_INPUT_TRACE=${WS_INPUT_TRACE}`);
     console.log(`> WS_DEBUG_PROBE=${WS_DEBUG_PROBE}`);
+    console.log(`> WS_PROBE_GAME=${WS_PROBE_GAME}`);
   });
 });
