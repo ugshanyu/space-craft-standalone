@@ -61,8 +61,11 @@ declare global {
 const CANVAS_SIZE = 1000;
 const JOIN_RETRY_LIMIT = Number(process.env.NEXT_PUBLIC_JOIN_RETRY_LIMIT || 4);
 const JOIN_RETRY_BACKOFF_MS = 600;
-const BRUTAL_CLIENT_SIDE_MODE = process.env.NEXT_PUBLIC_BRUTAL_CLIENT_SIDE_MODE !== "0";
+const BRUTAL_CLIENT_SIDE_MODE = process.env.NEXT_PUBLIC_BRUTAL_CLIENT_SIDE_MODE === "1";
 
+const WORLD_SIZE = 100;
+const PLAYER_RADIUS = 1.5;
+const PROJECTILE_RADIUS = 0.45;
 const INPUT_SEND_MS = 33;
 const INTERP_DELAY_MS = BRUTAL_CLIENT_SIDE_MODE ? 20 : 45;
 const UI_TICK_UPDATE_EVERY = 2;
@@ -107,10 +110,8 @@ function clamp(v: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, v));
 }
 
-function wrap(v: number, max: number): number {
-  let n = v % max;
-  if (n < 0) n += max;
-  return n;
+function clampToBoard(v: number, radius = 0): number {
+  return clamp(v, radius, WORLD_SIZE - radius);
 }
 
 function normalizeAngle(v: number): number {
@@ -232,13 +233,6 @@ function mergeDelta(base: WorldState | null, data: AnyObj): WorldState | null {
   return merged;
 }
 
-function shortestWrapDelta(a: number, b: number, size: number): number {
-  let d = b - a;
-  if (d > size / 2) d -= size;
-  if (d < -size / 2) d += size;
-  return d;
-}
-
 function lerpAngle(a: number, b: number, t: number): number {
   let d = b - a;
   while (d > Math.PI) d -= Math.PI * 2;
@@ -253,9 +247,9 @@ function shortestAngleDelta(a: number, b: number): number {
   return d;
 }
 
-function torusDistanceSq(ax: number, ay: number, bx: number, by: number, size: number): number {
-  const dx = shortestWrapDelta(ax, bx, size);
-  const dy = shortestWrapDelta(ay, by, size);
+function distanceSq(ax: number, ay: number, bx: number, by: number): number {
+  const dx = bx - ax;
+  const dy = by - ay;
   return dx * dx + dy * dy;
 }
 
@@ -272,8 +266,8 @@ function interpolateProjectiles(a: ProjectileState[], b: ProjectileState[], t: n
     }
     out.push({
       ...next,
-      x: wrap(prev.x + shortestWrapDelta(prev.x, next.x, 100) * t, 100),
-      y: wrap(prev.y + shortestWrapDelta(prev.y, next.y, 100) * t, 100),
+      x: prev.x + (next.x - prev.x) * t,
+      y: prev.y + (next.y - prev.y) * t,
       vx: prev.vx + (next.vx - prev.vx) * t,
       vy: prev.vy + (next.vy - prev.vy) * t,
       ttlMs: prev.ttlMs + (next.ttlMs - prev.ttlMs) * t,
@@ -301,8 +295,8 @@ function interpolateWorld(a: WorldState, b: WorldState, t: number): WorldState {
 
     outPlayers[pid] = {
       ...pb,
-      x: wrap(pa.x + shortestWrapDelta(pa.x, pb.x, 100) * t, 100),
-      y: wrap(pa.y + shortestWrapDelta(pa.y, pb.y, 100) * t, 100),
+      x: pa.x + (pb.x - pa.x) * t,
+      y: pa.y + (pb.y - pa.y) * t,
       vx: pa.vx + (pb.vx - pa.vx) * t,
       vy: pa.vy + (pb.vy - pa.vy) * t,
       angle: lerpAngle(pa.angle, pb.angle, t),
@@ -344,8 +338,25 @@ function applyInputToPlayer(base: PlayerState, input: InputPayload, dtSec: numbe
     p.vy *= s;
   }
 
-  p.x = wrap(p.x + p.vx * dtSec, 100);
-  p.y = wrap(p.y + p.vy * dtSec, 100);
+  p.x += p.vx * dtSec;
+  p.y += p.vy * dtSec;
+
+  const minPos = PLAYER_RADIUS;
+  const maxPos = WORLD_SIZE - PLAYER_RADIUS;
+  if (p.x < minPos) {
+    p.x = minPos;
+    if (p.vx < 0) p.vx = 0;
+  } else if (p.x > maxPos) {
+    p.x = maxPos;
+    if (p.vx > 0) p.vx = 0;
+  }
+  if (p.y < minPos) {
+    p.y = minPos;
+    if (p.vy < 0) p.vy = 0;
+  } else if (p.y > maxPos) {
+    p.y = maxPos;
+    if (p.vy > 0) p.vy = 0;
+  }
 
   return p;
 }
@@ -372,11 +383,19 @@ function blendServerAndLocalPlayer(serverPlayer: PlayerState | undefined, localP
 }
 
 function advanceProjectile(projectile: ProjectileState, dtSec: number, maxAgeMs: number): ProjectileState {
+  const x = projectile.x + projectile.vx * dtSec;
+  const y = projectile.y + projectile.vy * dtSec;
+  const outOfBounds = (
+    x < PROJECTILE_RADIUS ||
+    y < PROJECTILE_RADIUS ||
+    x > WORLD_SIZE - PROJECTILE_RADIUS ||
+    y > WORLD_SIZE - PROJECTILE_RADIUS
+  );
   return {
     ...projectile,
-    x: wrap(projectile.x + projectile.vx * dtSec, 100),
-    y: wrap(projectile.y + projectile.vy * dtSec, 100),
-    ttlMs: Math.max(0, Math.min(maxAgeMs, projectile.ttlMs - dtSec * 1000)),
+    x,
+    y,
+    ttlMs: outOfBounds ? 0 : Math.max(0, Math.min(maxAgeMs, projectile.ttlMs - dtSec * 1000)),
   };
 }
 
@@ -384,8 +403,8 @@ function makePredictedProjectile(myId: string, ship: PlayerState, id: string): P
   return {
     id,
     ownerId: myId,
-    x: wrap(ship.x + Math.cos(ship.angle) * PROJECTILE_MUZZLE_OFFSET, 100),
-    y: wrap(ship.y + Math.sin(ship.angle) * PROJECTILE_MUZZLE_OFFSET, 100),
+    x: clampToBoard(ship.x + Math.cos(ship.angle) * PROJECTILE_MUZZLE_OFFSET, PROJECTILE_RADIUS),
+    y: clampToBoard(ship.y + Math.sin(ship.angle) * PROJECTILE_MUZZLE_OFFSET, PROJECTILE_RADIUS),
     vx: Math.cos(ship.angle) * PROJECTILE_SPEED,
     vy: Math.sin(ship.angle) * PROJECTILE_SPEED,
     ttlMs: Math.min(PROJECTILE_TTL_MS, PREDICTED_PROJECTILE_BRIDGE_MS),
@@ -409,7 +428,7 @@ function reconcilePredictedProjectiles(
     for (let i = 0; i < mine.length; i++) {
       if (used.has(i)) continue;
       const serverShot = mine[i];
-      const d2 = torusDistanceSq(localShot.x, localShot.y, serverShot.x, serverShot.y, 100);
+      const d2 = distanceSq(localShot.x, localShot.y, serverShot.x, serverShot.y);
       if (d2 <= strictDistSq || (localShot.ttlMs > 250 && d2 <= laxDistSq)) {
         matchIdx = i;
         break;
@@ -437,7 +456,7 @@ function suppressLocalAuthoritativeDuplicates(
       out.push(pr);
       continue;
     }
-    const duplicatesPredicted = predicted.some((localPr) => torusDistanceSq(localPr.x, localPr.y, pr.x, pr.y, 100) <= suppressDistSq);
+    const duplicatesPredicted = predicted.some((localPr) => distanceSq(localPr.x, localPr.y, pr.x, pr.y) <= suppressDistSq);
     if (!duplicatesPredicted) out.push(pr);
   }
   return out;
@@ -453,7 +472,7 @@ function reconcileLocalPlayerVisual(
   if (!prevVisual) return { player: { ...authoritative }, corrected: true };
   if (!authoritative.alive) return { player: { ...authoritative }, corrected: true };
 
-  const posError = Math.sqrt(torusDistanceSq(prevVisual.x, prevVisual.y, authoritative.x, authoritative.y, 100));
+  const posError = Math.sqrt(distanceSq(prevVisual.x, prevVisual.y, authoritative.x, authoritative.y));
   const velError = Math.hypot(prevVisual.vx - authoritative.vx, prevVisual.vy - authoritative.vy);
   const angleError = Math.abs(shortestAngleDelta(prevVisual.angle, authoritative.angle));
 
@@ -474,8 +493,8 @@ function reconcileLocalPlayerVisual(
     corrected: true,
     player: {
       ...prevVisual,
-      x: wrap(prevVisual.x + shortestWrapDelta(prevVisual.x, authoritative.x, 100) * alpha, 100),
-      y: wrap(prevVisual.y + shortestWrapDelta(prevVisual.y, authoritative.y, 100) * alpha, 100),
+      x: prevVisual.x + (authoritative.x - prevVisual.x) * alpha,
+      y: prevVisual.y + (authoritative.y - prevVisual.y) * alpha,
       vx: prevVisual.vx + (authoritative.vx - prevVisual.vx) * alpha,
       vy: prevVisual.vy + (authoritative.vy - prevVisual.vy) * alpha,
       angle: normalizeAngle(lerpAngle(prevVisual.angle, authoritative.angle, alpha)),
@@ -819,7 +838,7 @@ export default function Page() {
         }
       }
 
-      if (joinedRef.current && gameStartedRef.current && keysRef.current.fire && localFireCooldownMsRef.current <= 0) {
+      if (!BRUTAL_CLIENT_SIDE_MODE && joinedRef.current && gameStartedRef.current && keysRef.current.fire && localFireCooldownMsRef.current <= 0) {
         const predictedMe = renderState.players[myPid];
         if (predictedMe?.alive) {
           predictedProjectileSeqRef.current += 1;
@@ -835,6 +854,9 @@ export default function Page() {
         renderState.projectiles,
         myPid,
       );
+      if (BRUTAL_CLIENT_SIDE_MODE && predictedProjectilesRef.current.length > 0) {
+        predictedProjectilesRef.current = [];
+      }
       if (renderState.players[myPid]) {
         localVisualPlayerRef.current = { ...renderState.players[myPid] };
       }
@@ -1195,8 +1217,8 @@ function drawWorld(world: WorldState, canvas: HTMLCanvasElement, myId: string) {
 
   const w = canvas.width;
   const h = canvas.height;
-  const sx = w / 100;
-  const sy = h / 100;
+  const sx = w / WORLD_SIZE;
+  const sy = h / WORLD_SIZE;
   const shipNose = 16;
   const shipTail = 12;
   const shipWing = 10;
@@ -1213,7 +1235,7 @@ function drawWorld(world: WorldState, canvas: HTMLCanvasElement, myId: string) {
 
   ctx.strokeStyle = "rgba(56,189,248,0.06)";
   ctx.lineWidth = 1;
-  for (let i = 10; i < 100; i += 10) {
+  for (let i = 10; i < WORLD_SIZE; i += 10) {
     ctx.beginPath();
     ctx.moveTo(i * sx, 0);
     ctx.lineTo(i * sx, h);

@@ -5,6 +5,8 @@
 
 const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
 const TAU = Math.PI * 2;
+const STATE_PRECISION = 10000;
+const roundState = (v) => Math.round(v * STATE_PRECISION) / STATE_PRECISION;
 
 export const CONFIG = {
   arenaWidth: 100,
@@ -129,8 +131,10 @@ export function tick(state, dtMs) {
       p.vy *= s;
     }
 
-    p.x = wrap(p.x + p.vx * dt, state.arena.width);
-    p.y = wrap(p.y + p.vy * dt, state.arena.height);
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    clampPlayerToArena(p, state);
+    quantizePlayerState(p);
 
     p.fireCooldownMs = Math.max(0, p.fireCooldownMs - dtMs);
     p.shield = Math.min(CONFIG.maxShield, p.shield + CONFIG.shieldRegenPerSecond * dt);
@@ -163,11 +167,15 @@ export function isTerminal(state) {
 
 function spawnProjectile(state, ownerId, p, lagCompMs = 0) {
   const muzzle = 2.0;
+  const minX = CONFIG.projectileRadius;
+  const maxX = state.arena.width - CONFIG.projectileRadius;
+  const minY = CONFIG.projectileRadius;
+  const maxY = state.arena.height - CONFIG.projectileRadius;
   const pr = {
     id: `${state.tick}:${ownerId}:${Math.random().toString(36).slice(2, 7)}`,
     ownerId,
-    x: wrap(p.x + Math.cos(p.angle) * muzzle, state.arena.width),
-    y: wrap(p.y + Math.sin(p.angle) * muzzle, state.arena.height),
+    x: clamp(p.x + Math.cos(p.angle) * muzzle, minX, maxX),
+    y: clamp(p.y + Math.sin(p.angle) * muzzle, minY, maxY),
     vx: Math.cos(p.angle) * CONFIG.projectileSpeed,
     vy: Math.sin(p.angle) * CONFIG.projectileSpeed,
     ttlMs: CONFIG.projectileTtlMs,
@@ -177,10 +185,13 @@ function spawnProjectile(state, ownerId, p, lagCompMs = 0) {
   const appliedLagMs = clamp(Number(lagCompMs || 0), 0, CONFIG.maxLagCompensationMs);
   if (appliedLagMs > 0) {
     const lagDt = appliedLagMs / 1000;
-    pr.x = wrap(pr.x + pr.vx * lagDt, state.arena.width);
-    pr.y = wrap(pr.y + pr.vy * lagDt, state.arena.height);
+    pr.x += pr.vx * lagDt;
+    pr.y += pr.vy * lagDt;
+    pr.x = clamp(pr.x, minX, maxX);
+    pr.y = clamp(pr.y, minY, maxY);
     pr.ttlMs = Math.max(0, pr.ttlMs - appliedLagMs);
   }
+  quantizeProjectileState(pr);
 
   state.projectiles.push(pr);
 }
@@ -193,13 +204,15 @@ function updateProjectiles(state, dtMs) {
     pr.ttlMs -= dtMs;
     if (pr.ttlMs <= 0) continue;
 
-    pr.x = wrap(pr.x + pr.vx * dt, state.arena.width);
-    pr.y = wrap(pr.y + pr.vy * dt, state.arena.height);
+    pr.x += pr.vx * dt;
+    pr.y += pr.vy * dt;
+    if (isOutOfArena(pr.x, pr.y, state, CONFIG.projectileRadius)) continue;
+    quantizeProjectileState(pr);
 
     let hit = null;
     for (const [pid, p] of Object.entries(state.players)) {
       if (!p.alive || pid === pr.ownerId) continue;
-      if (torusDistSq(pr.x, pr.y, p.x, p.y, state.arena.width, state.arena.height) <= Math.pow(CONFIG.playerRadius + CONFIG.projectileRadius, 2)) {
+      if (distSq(pr.x, pr.y, p.x, p.y) <= Math.pow(CONFIG.playerRadius + CONFIG.projectileRadius, 2)) {
         hit = pid;
         break;
       }
@@ -236,10 +249,14 @@ function spawnPickups(state) {
 
   const r1 = pseudoRandom(state.seed + state.tick * 7919);
   const r2 = pseudoRandom(state.seed + state.tick * 1543);
+  const minX = CONFIG.pickupRadius;
+  const maxX = state.arena.width - CONFIG.pickupRadius;
+  const minY = CONFIG.pickupRadius;
+  const maxY = state.arena.height - CONFIG.pickupRadius;
   state.pickups.push({
     id: `pu:${state.tick}:${state.pickups.length}`,
-    x: 12 + r1 * 76,
-    y: 12 + r2 * 76,
+    x: roundState(minX + r1 * Math.max(0.0001, (maxX - minX))),
+    y: roundState(minY + r2 * Math.max(0.0001, (maxY - minY))),
     type: 'weapon_boost',
     value: 1,
   });
@@ -251,7 +268,7 @@ function collectPickups(state) {
     let collectorId = null;
     for (const [pid, p] of Object.entries(state.players)) {
       if (!p.alive) continue;
-      if (torusDistSq(pickup.x, pickup.y, p.x, p.y, state.arena.width, state.arena.height) <= CONFIG.pickupRadius * CONFIG.pickupRadius) {
+      if (distSq(pickup.x, pickup.y, p.x, p.y) <= CONFIG.pickupRadius * CONFIG.pickupRadius) {
         collectorId = pid;
         break;
       }
@@ -299,22 +316,59 @@ function pseudoRandom(seed) {
   return x - Math.floor(x);
 }
 
-function wrap(v, max) {
-  let n = v % max;
-  if (n < 0) n += max;
-  return n;
-}
-
 function normalizeAngle(a) {
   let n = a % TAU;
   if (n < 0) n += TAU;
-  return n;
+  return roundState(n);
 }
 
-function torusDistSq(ax, ay, bx, by, w, h) {
-  let dx = Math.abs(ax - bx);
-  let dy = Math.abs(ay - by);
-  if (dx > w / 2) dx = w - dx;
-  if (dy > h / 2) dy = h - dy;
+function distSq(ax, ay, bx, by) {
+  const dx = ax - bx;
+  const dy = ay - by;
   return dx * dx + dy * dy;
+}
+
+function clampPlayerToArena(player, state) {
+  const minX = CONFIG.playerRadius;
+  const maxX = state.arena.width - CONFIG.playerRadius;
+  const minY = CONFIG.playerRadius;
+  const maxY = state.arena.height - CONFIG.playerRadius;
+  if (player.x < minX) {
+    player.x = minX;
+    if (player.vx < 0) player.vx = 0;
+  } else if (player.x > maxX) {
+    player.x = maxX;
+    if (player.vx > 0) player.vx = 0;
+  }
+  if (player.y < minY) {
+    player.y = minY;
+    if (player.vy < 0) player.vy = 0;
+  } else if (player.y > maxY) {
+    player.y = maxY;
+    if (player.vy > 0) player.vy = 0;
+  }
+}
+
+function isOutOfArena(x, y, state, radius) {
+  return (
+    x < radius ||
+    y < radius ||
+    x > state.arena.width - radius ||
+    y > state.arena.height - radius
+  );
+}
+
+function quantizePlayerState(player) {
+  player.x = roundState(player.x);
+  player.y = roundState(player.y);
+  player.vx = roundState(player.vx);
+  player.vy = roundState(player.vy);
+  player.angle = roundState(player.angle);
+}
+
+function quantizeProjectileState(projectile) {
+  projectile.x = roundState(projectile.x);
+  projectile.y = roundState(projectile.y);
+  projectile.vx = roundState(projectile.vx);
+  projectile.vy = roundState(projectile.vy);
 }
