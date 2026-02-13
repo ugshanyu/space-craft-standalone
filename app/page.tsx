@@ -62,7 +62,7 @@ const JOIN_RETRY_LIMIT = Number(process.env.NEXT_PUBLIC_JOIN_RETRY_LIMIT || 4);
 const JOIN_RETRY_BACKOFF_MS = 600;
 
 const INPUT_SEND_MS = 33;
-const INTERP_DELAY_MS = 60;
+const INTERP_DELAY_MS = 45;
 const UI_TICK_UPDATE_EVERY = 2;
 const MAX_PENDING_INPUTS = 120;
 const IMMEDIATE_INPUT_MIN_GAP_MS = 12;
@@ -75,6 +75,7 @@ const PROJECTILE_TTL_MS = 1100;
 const PROJECTILE_MUZZLE_OFFSET = 2;
 const PREDICTED_PROJECTILE_BRIDGE_MS = 450;
 const PROJECTILE_RECONCILE_DIST = 2.6;
+const PROJECTILE_RECONCILE_DIST_LAX = 12;
 
 const TURN_RATE = 3.8;
 const ACCEL_FORWARD = 55;
@@ -367,7 +368,8 @@ function reconcilePredictedProjectiles(
   const mine = (authoritative || []).filter((pr) => pr.ownerId === myId);
   if (mine.length === 0) return predicted;
 
-  const maxDistSq = PROJECTILE_RECONCILE_DIST * PROJECTILE_RECONCILE_DIST;
+  const strictDistSq = PROJECTILE_RECONCILE_DIST * PROJECTILE_RECONCILE_DIST;
+  const laxDistSq = PROJECTILE_RECONCILE_DIST_LAX * PROJECTILE_RECONCILE_DIST_LAX;
   const used = new Set<number>();
   const out: ProjectileState[] = [];
   for (const localShot of predicted) {
@@ -375,7 +377,8 @@ function reconcilePredictedProjectiles(
     for (let i = 0; i < mine.length; i++) {
       if (used.has(i)) continue;
       const serverShot = mine[i];
-      if (torusDistanceSq(localShot.x, localShot.y, serverShot.x, serverShot.y, 100) <= maxDistSq) {
+      const d2 = torusDistanceSq(localShot.x, localShot.y, serverShot.x, serverShot.y, 100);
+      if (d2 <= strictDistSq || (localShot.ttlMs > 250 && d2 <= laxDistSq)) {
         matchIdx = i;
         break;
       }
@@ -385,6 +388,25 @@ function reconcilePredictedProjectiles(
     } else {
       out.push(localShot);
     }
+  }
+  return out;
+}
+
+function suppressLocalAuthoritativeDuplicates(
+  authoritative: ProjectileState[],
+  predicted: ProjectileState[],
+  myId: string,
+): ProjectileState[] {
+  if (!myId || predicted.length === 0) return authoritative;
+  const suppressDistSq = PROJECTILE_RECONCILE_DIST_LAX * PROJECTILE_RECONCILE_DIST_LAX;
+  const out: ProjectileState[] = [];
+  for (const pr of authoritative) {
+    if (pr.ownerId !== myId) {
+      out.push(pr);
+      continue;
+    }
+    const duplicatesPredicted = predicted.some((localPr) => torusDistanceSq(localPr.x, localPr.y, pr.x, pr.y, 100) <= suppressDistSq);
+    if (!duplicatesPredicted) out.push(pr);
   }
   return out;
 }
@@ -680,9 +702,14 @@ export default function Page() {
     }
 
     if (predictedProjectilesRef.current.length > 0) {
+      const authoritativeProjectiles = suppressLocalAuthoritativeDuplicates(
+        renderState.projectiles,
+        predictedProjectilesRef.current,
+        myPid,
+      );
       renderState = {
         ...renderState,
-        projectiles: [...renderState.projectiles, ...predictedProjectilesRef.current],
+        projectiles: [...authoritativeProjectiles, ...predictedProjectilesRef.current],
       };
     }
 
