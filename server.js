@@ -10,32 +10,30 @@ import { submitMatchResult } from './server/webhook.js';
 const dev = process.env.NODE_ENV !== 'production';
 const app = next({ dev });
 const handle = app.getRequestHandler();
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
 
-// Game Server Config
 const API_URL = (process.env.API_URL || 'https://mobile.mongolai.mn').replace(/\/$/, '');
 const JWKS_URL = process.env.JWKS_URL || `${API_URL}/.well-known/jwks.json`;
 const SERVICE_ID = process.env.SERVICE_ID || null;
 const SIGNING_KEY_ID = process.env.SIGNING_KEY_ID || 'space-craft-key-1';
 const SIGNING_SECRET = process.env.SIGNING_SECRET || 'CHANGE_ME_IN_PRODUCTION';
-const TICK_RATE_HZ = 20;
-const TICK_MS = 1000 / TICK_RATE_HZ;
-const SNAPSHOT_INTERVAL_TICKS = 20;
-const MIN_PLAYERS = 2;
 
-const rooms = new Map(); // roomId -> RoomRuntime
+const MIN_PLAYERS = 2;
+const SIM_TICK_HZ = 60;
+const SIM_TICK_MS = Math.floor(1000 / SIM_TICK_HZ);
+const SNAPSHOT_HZ = 20;
+const SNAPSHOT_EVERY_TICKS = Math.max(1, Math.floor(SIM_TICK_HZ / SNAPSHOT_HZ));
+
+const rooms = new Map();
 
 function sendJson(ws, frame) {
-  const text = JSON.stringify(frame);
-  if (ws.readyState !== ws.OPEN) {
+  if (!ws || ws.readyState !== 1) return false;
+  try {
+    ws.send(JSON.stringify(frame));
+    return true;
+  } catch {
     return false;
   }
-  ws.send(text, (err) => {
-    if (err) {
-      console.error('[WS] send_error', err.message);
-    }
-  });
-  return true;
 }
 
 process.on('unhandledRejection', (reason) => {
@@ -47,49 +45,40 @@ process.on('uncaughtException', (err) => {
 });
 
 class RoomRuntime {
-  constructor(roomId, serviceId, playerIds, minPlayers) {
+  constructor(roomId, serviceId) {
     this.roomId = roomId;
     this.serviceId = serviceId || null;
-    this.playerIds = playerIds;
-    this.minPlayers = minPlayers || MIN_PLAYERS;
+
+    this.minPlayers = MIN_PLAYERS;
+    this.sessions = new Map(); // sessionId -> { userId, ws }
     this.connectedUserIds = new Set();
-    this.sessions = new Map();
-    this.inputQueue = [];
+
     this.running = false;
     this.finished = false;
-    this.tickInterval = null;
-    this.state = null;
-    this.prevProjIds = new Set();
+    this.tickHandle = null;
+
     this.serverTick = 0;
+    this.state = null;
+
+    this.latestInputByUser = new Map(); // userId -> payload
+    this.lastSeqByUser = {}; // monotonic validation
     this.ackSeqByPlayer = {};
   }
 
-  start() {
-    if (this.running) return;
-    const allPlayerIds = [...this.connectedUserIds];
-    this.playerIds = allPlayerIds;
-    this.state = Game.initState(allPlayerIds, hashRoomId(this.roomId));
-    this.prevProjIds = new Set();
-    for (const pid of allPlayerIds) this.ackSeqByPlayer[pid] = 0;
-    this.running = true;
-    this.tickInterval = setInterval(() => this.tick(), TICK_MS);
-    this.broadcast('game_start', { player_ids: allPlayerIds, room_id: this.roomId });
+  get activePlayers() {
+    return [...this.connectedUserIds];
   }
 
-  stop() {
-    this.running = false;
-    if (this.tickInterval) {
-      clearInterval(this.tickInterval);
-      this.tickInterval = null;
-    }
-  }
-
-  addSession(sessionId, userId, ws) {
+  upsertSession(sessionId, userId, ws) {
     this.sessions.set(sessionId, { userId, ws });
     this.connectedUserIds.add(userId);
-    // A (re)join creates a fresh direct stream from seq=1 on the client SDK.
-    // Reset per-player ack baseline to avoid permanent NON_MONOTONIC_SEQ rejects.
+
+    // New direct connection can restart seq at 1.
+    this.lastSeqByUser[userId] = 0;
     this.ackSeqByPlayer[userId] = 0;
+    if (!this.latestInputByUser.has(userId)) {
+      this.latestInputByUser.set(userId, { turn: 0, thrust: 0, fire: false });
+    }
   }
 
   removeSession(sessionId) {
@@ -100,100 +89,108 @@ class RoomRuntime {
       const stillConnected = [...this.sessions.values()].some((s) => s.userId === removed.userId);
       if (!stillConnected) {
         this.connectedUserIds.delete(removed.userId);
+        delete this.lastSeqByUser[removed.userId];
         delete this.ackSeqByPlayer[removed.userId];
+        this.latestInputByUser.delete(removed.userId);
       }
     }
 
-    // If a running match loses a participant, end and clean up room state.
-    if (this.running && !this.finished && this.sessions.size < this.minPlayers) {
+    if (this.running && !this.finished && this.connectedUserIds.size < this.minPlayers) {
       this.finished = true;
-      const finalStats = {};
-      if (this.state?.players) {
-        for (const [pid, p] of Object.entries(this.state.players)) {
-          finalStats[pid] = p.stats;
-        }
-      }
-      const survivors = [...new Set([...this.sessions.values()].map((s) => s.userId))];
       this.broadcast('match_end', {
         room_id: this.roomId,
         protocol_version: '2',
         server_ts: Date.now(),
         server_tick: this.serverTick,
-        winner_ids: survivors,
+        winner_ids: [...this.connectedUserIds],
         reason: 'player_disconnected',
-        final_stats: finalStats,
+        final_stats: buildFinalStats(this.state),
       });
       this.stop();
-
-      // Close surviving sockets and drop the room immediately.
-      for (const { ws } of this.sessions.values()) {
-        try { ws.close(4001, 'player_disconnected'); } catch {}
-      }
-      this.sessions.clear();
-      this.connectedUserIds.clear();
-      this.inputQueue = [];
       rooms.delete(this.roomId);
       return;
     }
 
-    // Always destroy empty rooms to avoid leaked tick loops and stale state.
     if (this.sessions.size === 0) {
       this.stop();
-      this.connectedUserIds.clear();
-      this.inputQueue = [];
       rooms.delete(this.roomId);
     }
   }
 
-  enqueueInput(userId, seq, inputType, payload, clientTs) {
-    if (this.finished) return { accepted: false, reason: 'MATCH_FINISHED' };
-    const lastSeq = this.ackSeqByPlayer[userId] || 0;
-    if (seq <= lastSeq) return { accepted: false, reason: 'NON_MONOTONIC_SEQ', expectedGt: lastSeq };
-    this.inputQueue.push({ userId, seq, inputType, payload, clientTs });
-    return { accepted: true, queued: this.inputQueue.length };
+  enqueueInput(userId, seq, payload) {
+    if (!this.running || this.finished) {
+      return { accepted: false, reason: 'ROOM_NOT_RUNNING' };
+    }
+
+    const safeSeq = Number(seq || 0);
+    const lastSeq = Number(this.lastSeqByUser[userId] || 0);
+    if (safeSeq <= lastSeq) {
+      // Drop stale/duplicate packets silently.
+      return { accepted: false, reason: 'STALE_INPUT' };
+    }
+
+    this.lastSeqByUser[userId] = safeSeq;
+    this.ackSeqByPlayer[userId] = safeSeq;
+    this.latestInputByUser.set(userId, {
+      turn: Number(payload?.turn || 0),
+      thrust: Number(payload?.thrust || 0),
+      fire: Boolean(payload?.fire),
+    });
+    return { accepted: true };
+  }
+
+  maybeStart() {
+    if (this.running || this.finished) return;
+    if (this.connectedUserIds.size < this.minPlayers) return;
+
+    const players = this.activePlayers.slice(0, 2);
+    this.state = Game.initState(players, hashRoomId(this.roomId));
+    this.running = true;
+    this.serverTick = 0;
+
+    this.broadcast('game_start', {
+      room_id: this.roomId,
+      player_ids: players,
+    });
+
+    this.tickHandle = setInterval(() => this.tick(), SIM_TICK_MS);
+  }
+
+  stop() {
+    this.running = false;
+    if (this.tickHandle) {
+      clearInterval(this.tickHandle);
+      this.tickHandle = null;
+    }
   }
 
   tick() {
-    if (this.finished || !this.state) return;
-    this.serverTick++;
+    if (!this.running || this.finished || !this.state) return;
 
-    for (const event of this.inputQueue) {
-      Game.applyInput(this.state, event.userId, event.payload);
-      this.ackSeqByPlayer[event.userId] = Math.max(this.ackSeqByPlayer[event.userId] || 0, event.seq);
+    this.serverTick += 1;
+
+    for (const [pid, input] of this.latestInputByUser.entries()) {
+      Game.applyInput(this.state, pid, input);
     }
-    this.inputQueue.length = 0;
 
-    Game.tick(this.state, TICK_MS);
+    Game.tick(this.state, SIM_TICK_MS);
 
-    // Track removed projectiles without cloning entire state
-    const currProjIds = new Set(this.state.projectiles.map(p => p.id));
-    const removedProjs = [];
-    for (const id of this.prevProjIds) {
-      if (!currProjIds.has(id)) removedProjs.push(id);
-    }
-    this.prevProjIds = currProjIds;
+    const payloadBase = {
+      room_id: this.roomId,
+      protocol_version: '2',
+      server_ts: Date.now(),
+      server_tick: this.serverTick,
+      ack_seq_by_player: this.ackSeqByPlayer,
+    };
 
-    const isSnapshot = this.serverTick % SNAPSHOT_INTERVAL_TICKS === 0;
-
-    if (isSnapshot) {
-      // Full snapshot only (no delta on the same tick)
+    if (this.serverTick % SNAPSHOT_EVERY_TICKS === 0) {
       this.broadcast('state_snapshot', {
-        room_id: this.roomId,
-        protocol_version: '2',
-        server_ts: Date.now(),
-        server_tick: this.serverTick,
-        ack_seq_by_player: this.ackSeqByPlayer,
-        full_state: fastCloneState(this.state),
+        ...payloadBase,
+        full_state: cloneState(this.state),
       });
     } else {
-      // Lightweight delta – references state objects directly (no clone needed,
-      // they are freshly produced by Game.tick and won't be mutated until next tick).
       this.broadcast('state_delta', {
-        room_id: this.roomId,
-        protocol_version: '2',
-        server_ts: Date.now(),
-        server_tick: this.serverTick,
-        ack_seq_by_player: this.ackSeqByPlayer,
+        ...payloadBase,
         changed_entities: {
           phase: this.state.phase,
           remainingMs: this.state.remainingMs,
@@ -201,38 +198,34 @@ class RoomRuntime {
           projectiles: this.state.projectiles,
           pickups: this.state.pickups,
         },
-        removed_entities: { projectiles: removedProjs },
+        removed_entities: { projectiles: [] },
       });
     }
 
-    const result = Game.isTerminal(this.state);
-    if (result.terminal) {
-      this.finished = true;
-      this.handleMatchEnd(result);
-    }
+    const terminal = Game.isTerminal(this.state);
+    if (!terminal.terminal) return;
+
+    this.finished = true;
+    this.handleMatchEnd(terminal).catch((err) => {
+      console.error('[MATCH_END] error', err?.message || err);
+    });
   }
 
-  async handleMatchEnd(result) {
-    const finalStats = {};
-    for (const [pid, p] of Object.entries(this.state.players)) {
-      finalStats[pid] = p.stats;
-    }
+  async handleMatchEnd(terminal) {
+    const finalStats = buildFinalStats(this.state);
 
-    const matchEndPayload = {
+    this.broadcast('match_end', {
       room_id: this.roomId,
       protocol_version: '2',
       server_ts: Date.now(),
       server_tick: this.serverTick,
-      winner_ids: result.winnerIds,
-      reason: result.reason,
+      winner_ids: terminal.winnerIds,
+      reason: terminal.reason,
       final_stats: finalStats,
-    };
-    this.broadcast('match_end', matchEndPayload);
+    });
 
     try {
-      if (!this.serviceId) {
-        throw new Error('Missing service_id for result submission');
-      }
+      if (!this.serviceId) throw new Error('Missing service_id for result submission');
       await submitMatchResult({
         apiUrl: API_URL,
         serviceId: this.serviceId,
@@ -240,152 +233,129 @@ class RoomRuntime {
         signingSecret: SIGNING_SECRET,
         roomId: this.roomId,
         sessionId: [...this.sessions.keys()][0] || crypto.randomUUID(),
-        winnerIds: result.winnerIds,
-        participants: this.playerIds,
-        reason: result.reason,
+        winnerIds: terminal.winnerIds,
+        participants: this.activePlayers,
+        reason: terminal.reason,
         finalStats,
       });
     } catch (err) {
-      console.error('[WEBHOOK] Failed to submit result:', err.message);
+      console.error('[WEBHOOK] submit failed', err?.message || err);
     }
 
     this.stop();
   }
 
   broadcast(type, payload) {
-    const message = JSON.stringify({ type, payload });
+    const msg = JSON.stringify({ type, payload });
     for (const { ws } of this.sessions.values()) {
-      if (ws.readyState === 1) ws.send(message);
+      if (ws.readyState === 1) {
+        try { ws.send(msg); } catch {}
+      }
     }
   }
+}
+
+function cloneState(state) {
+  if (!state) return null;
+  const players = {};
+  for (const [pid, p] of Object.entries(state.players || {})) {
+    players[pid] = {
+      ...p,
+      input: p.input ? { ...p.input } : { turn: 0, thrust: 0, fire: false },
+      stats: p.stats ? { ...p.stats } : { kills: 0, deaths: 0, damageDealt: 0, pickups: 0 },
+    };
+  }
+  return {
+    ...state,
+    arena: { ...state.arena },
+    players,
+    projectiles: (state.projectiles || []).map((x) => ({ ...x })),
+    pickups: (state.pickups || []).map((x) => ({ ...x })),
+    winnerIds: [...(state.winnerIds || [])],
+  };
+}
+
+function buildFinalStats(state) {
+  if (!state?.players) return {};
+  const out = {};
+  for (const [pid, p] of Object.entries(state.players)) {
+    out[pid] = p.stats || {};
+  }
+  return out;
 }
 
 function hashRoomId(roomId) {
   return parseInt(crypto.createHash('sha256').update(roomId).digest('hex').slice(0, 12), 16);
 }
 
-/** Lightweight clone of game state – avoids expensive structuredClone. */
-function fastCloneState(state) {
-  const players = {};
-  for (const [pid, p] of Object.entries(state.players)) {
-    players[pid] = { ...p, stats: { ...p.stats } };
-  }
-  return {
-    ...state,
-    arena: { ...state.arena },
-    players,
-    projectiles: state.projectiles.map(p => ({ ...p })),
-    pickups: state.pickups.map(p => ({ ...p })),
-    winnerIds: [...state.winnerIds],
-  };
-}
-
-async function fetchRoomInfo(roomId) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5000); // 5s timeout
-  try {
-    const resp = await fetch(`${API_URL}/games/rooms/${encodeURIComponent(roomId)}`, {
-      headers: { 'Content-Type': 'application/json' },
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
-    if (!resp.ok) {
-      return null;
-    }
-    const data = await resp.json();
-    return data;
-  } catch (err) {
-    clearTimeout(timeout);
-    console.error('[ROOM] Error fetching room info:', err.message);
-    return null;
-  }
-}
-
 function handleMessage(ws, session, msg) {
-  const { type, payload } = msg;
-  const topSeq = msg.seq || 0;
-  const topTs = msg.ts || Date.now();
+  const type = msg?.type;
+  const payload = msg?.payload || {};
+  const seq = Number(msg?.seq || 0);
 
   if (type === 'join') {
     let room = rooms.get(session.roomId);
     if (!room) {
-      room = new RoomRuntime(session.roomId, session.serviceId, [], MIN_PLAYERS);
+      room = new RoomRuntime(session.roomId, session.serviceId);
       rooms.set(session.roomId, room);
     }
 
-    // Idempotent join: same session reconnect/join retries should not duplicate state.
-    if (room.sessions.has(session.sessionId)) {
-      // Rebind websocket for the same session (tab refresh/reconnect).
-      // Keep room membership but reset input ack so the restarted client seq is accepted.
-      room.addSession(session.sessionId, session.userId, ws);
-      const waitingFor = Math.max(0, room.minPlayers - room.connectedUserIds.size);
-      sendJson(ws, {
-        type: 'joined',
-        payload: {
-          room_id: session.roomId,
-          player_id: session.userId,
-          player_ids: [...room.connectedUserIds],
-          waiting_for: waitingFor,
-        },
-      });
-      return;
-    }
+    room.upsertSession(session.sessionId, session.userId, ws);
 
-    room.addSession(session.sessionId, session.userId, ws);
     const waitingFor = Math.max(0, room.minPlayers - room.connectedUserIds.size);
     sendJson(ws, {
       type: 'joined',
       payload: {
-        room_id: session.roomId,
+        room_id: room.roomId,
         player_id: session.userId,
-        player_ids: [...room.connectedUserIds],
+        player_ids: room.activePlayers,
         waiting_for: waitingFor,
       },
     });
+
     room.broadcast('player_joined', {
+      room_id: room.roomId,
       player_id: session.userId,
-      player_ids: [...room.connectedUserIds],
+      player_ids: room.activePlayers,
       waiting_for: waitingFor,
     });
 
-    if (!room.running && room.connectedUserIds.size >= room.minPlayers) {
-      room.start();
-    }
-  } else if (type === 'input') {
-    const room = rooms.get(session.roomId);
-    if (!room || !room.running) return;
-    
-    const inputPayload = (payload && payload.action_data) || payload || {};
-    const inputType = (payload && payload.action_type) || payload?.input_type || 'control';
+    room.maybeStart();
+    return;
+  }
 
-    const result = room.enqueueInput(
-      session.userId,
-      topSeq,
-      inputType,
-      inputPayload,
-      topTs
-    );
-    if (!result.accepted) {
-      sendJson(ws, { type: 'error', payload: { code: 'INPUT_REJECTED', ...result } });
-    }
-  } else if (type === 'ping') {
+  if (type === 'input') {
     const room = rooms.get(session.roomId);
-    const serverTick = room ? room.serverTick : 0;
+    if (!room) return;
+
+    const inputPayload = payload?.action_data || payload || {};
+    room.enqueueInput(session.userId, seq, inputPayload);
+    return;
+  }
+
+  if (type === 'ping') {
+    const room = rooms.get(session.roomId);
     sendJson(ws, {
       type: 'pong',
       payload: {
         room_id: session.roomId,
-        server_tick: serverTick,
+        server_tick: room?.serverTick || 0,
         server_ts: Date.now(),
       },
     });
-  } else if (type === 'leave') {
+    return;
+  }
+
+  if (type === 'leave') {
     const room = rooms.get(session.roomId);
     if (room) {
       room.removeSession(session.sessionId);
-      room.broadcast('player_left', { player_id: session.userId });
+      room.broadcast('player_left', {
+        room_id: room.roomId,
+        player_id: session.userId,
+      });
     }
-    ws.close();
+    try { ws.close(); } catch {}
   }
 }
 
@@ -399,11 +369,8 @@ app.prepare().then(() => {
 
   server.on('upgrade', (request, socket, head) => {
     const reqUrl = new URL(request.url || '/', `http://localhost:${PORT}`);
-    if (reqUrl.pathname.startsWith('/_next/')) {
-      return;
-    }
+    if (reqUrl.pathname.startsWith('/_next/')) return;
 
-    // Only accept the direct game websocket endpoint.
     if (reqUrl.pathname !== '/ws') {
       socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
       socket.destroy();
@@ -416,43 +383,50 @@ app.prepare().then(() => {
   });
 
   wss.on('connection', (ws, req) => {
-    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const url = new URL(req.url || '/', `http://localhost:${PORT}`);
     const token = url.searchParams.get('token');
-    
-    let session = { userId: null, roomId: null, sessionId: null, serviceId: null };
-    let pendingMessages = [];
+
+    const session = {
+      userId: null,
+      roomId: null,
+      sessionId: null,
+      serviceId: null,
+    };
+
     let authComplete = false;
+    const buffered = [];
 
     ws.on('message', (data) => {
       try {
-        const msg = JSON.parse(data.toString());
+        const msg = JSON.parse(String(data));
         if (!authComplete) {
-          pendingMessages.push(msg);
+          buffered.push(msg);
           return;
         }
         handleMessage(ws, session, msg);
       } catch (err) {
-        console.error('[WS] message_parse_error', err.message);
+        console.error('[WS] parse_error', err?.message || err);
       }
     });
 
     ws.on('close', () => {
-      if (session.roomId && session.sessionId) {
-        const room = rooms.get(session.roomId);
-        if (room) {
-          room.removeSession(session.sessionId);
-          room.broadcast('player_left', { player_id: session.userId });
-        }
-      }
+      if (!session.roomId || !session.sessionId) return;
+      const room = rooms.get(session.roomId);
+      if (!room) return;
+      room.removeSession(session.sessionId);
+      room.broadcast('player_left', {
+        room_id: room.roomId,
+        player_id: session.userId,
+      });
     });
 
     ws.on('error', (err) => {
-      console.error('[WS] ws_error', err.message);
+      console.error('[WS] socket_error', err?.message || err);
     });
 
     if (!token) {
       sendJson(ws, { type: 'error', payload: { code: 'NO_TOKEN', message: 'Missing access token' } });
-      ws.close();
+      try { ws.close(); } catch {}
       return;
     }
 
@@ -466,24 +440,21 @@ app.prepare().then(() => {
         session.sessionId = payload.session_id;
         session.serviceId = payload.service_id || null;
         authComplete = true;
-        if (ws.readyState !== ws.OPEN) return;
 
-        if (pendingMessages.length > 0) {
-          for (const msg of pendingMessages) {
-            handleMessage(ws, session, msg);
-          }
-          pendingMessages = [];
-        }
+        if (ws.readyState !== 1) return;
+        for (const msg of buffered) handleMessage(ws, session, msg);
+        buffered.length = 0;
       })
       .catch((err) => {
-        console.error('[WS] auth_failed', err.message);
-        sendJson(ws, { type: 'error', payload: { code: 'INVALID_TOKEN', message: err.message } });
-        ws.close();
+        console.error('[WS] auth_failed', err?.message || err);
+        sendJson(ws, { type: 'error', payload: { code: 'INVALID_TOKEN', message: err?.message || 'Invalid token' } });
+        try { ws.close(); } catch {}
       });
   });
 
   server.listen(PORT, (err) => {
     if (err) throw err;
     console.log(`> Ready on http://localhost:${PORT}`);
+    console.log(`[GAME] sim=${SIM_TICK_HZ}Hz snapshot=${SNAPSHOT_HZ}Hz`);
   });
 });
