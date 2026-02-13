@@ -55,6 +55,7 @@ type PendingInput = { transportSeq: number; payload: InputPayload; dtSec: number
 type PerfHud = { fps: number; netGapMs: number; jitterMs: number; pendingInputs: number };
 type NetDebugHud = { mode: string; transport: string; rttMs: number | null };
 type ServerDebugHud = { region: string; simHz: number | null; netHz: number | null };
+type LogLine = { id: number; ts: string; text: string };
 
 declare global {
   interface Window {
@@ -551,6 +552,7 @@ export default function Page() {
   const [perfHud, setPerfHud] = useState<PerfHud>({ fps: 0, netGapMs: 0, jitterMs: 0, pendingInputs: 0 });
   const [netDebugHud, setNetDebugHud] = useState<NetDebugHud>({ mode: "unknown", transport: "-", rttMs: null });
   const [serverDebugHud, setServerDebugHud] = useState<ServerDebugHud>({ region: "-", simHz: null, netHz: null });
+  const [logLines, setLogLines] = useState<LogLine[]>([]);
 
   const worldRef = useRef<WorldState | null>(null);
   const snapshotsRef = useRef<SnapshotFrame[]>([]);
@@ -586,6 +588,9 @@ export default function Page() {
   const netStatsRef = useRef({ lastPacketAt: 0, emaGapMs: 0, jitterMs: 0 });
   const fpsWindowRef = useRef({ startedAt: 0, frames: 0 });
   const pingRef = useRef({ sentAt: 0, emaRttMs: 0 });
+  const logSeqRef = useRef(0);
+  const lastNetSummaryRef = useRef("");
+  const lastHighQueueLogAtRef = useRef(0);
 
   joinedRef.current = joined;
   gameStartedRef.current = gameStarted;
@@ -593,6 +598,21 @@ export default function Page() {
   useEffect(() => {
     if (window.Usion?._initialized) return;
     window.Usion?.init?.();
+  }, []);
+
+  function appendLog(text: string) {
+    const ts = new Date().toLocaleTimeString();
+    const id = ++logSeqRef.current;
+    setLogLines((prev) => {
+      const next = [...prev, { id, ts, text }];
+      if (next.length > 40) return next.slice(next.length - 40);
+      return next;
+    });
+  }
+
+  useEffect(() => {
+    appendLog("Game window initialized");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function sendControlInput(usion: AnyObj, input: InputPayload, sentAtMs = performance.now()) {
@@ -780,6 +800,11 @@ export default function Page() {
 
       const rttMs = pingRef.current.emaRttMs > 0 ? Math.round(pingRef.current.emaRttMs) : null;
       setNetDebugHud({ mode, transport, rttMs });
+      const summary = `${mode}|${transport}|${rttMs ?? "-"}`;
+      if (summary !== lastNetSummaryRef.current) {
+        lastNetSummaryRef.current = summary;
+        appendLog(`Net ${mode}, tx ${transport}, rtt ${rttMs ?? "-"}ms`);
+      }
     }, 500);
 
     return () => {
@@ -1133,6 +1158,7 @@ export default function Page() {
           setJoined(true);
           setPlayerCount((data?.player_ids || []).length);
           const waiting = Number(data?.waiting_for || 0);
+          appendLog(`Joined room ${String(data?.room_id || activeRoomIdRef.current)} as ${joinedPlayerId || myIdRef.current}`);
           setStatus(waiting > 0 ? `Waiting for ${waiting} player(s)...` : "All players connected");
         });
 
@@ -1160,6 +1186,7 @@ export default function Page() {
           localVisualPlayerRef.current = null;
           lastLocalCorrectionAtRef.current = 0;
           setGameStarted(true);
+          appendLog("Game started");
           setStatus("Fight");
         });
 
@@ -1182,6 +1209,9 @@ export default function Page() {
             if (sample > 0 && sample < 5000) {
               const prev = pingRef.current.emaRttMs || sample;
               pingRef.current.emaRttMs = prev * 0.75 + sample * 0.25;
+              if (sample >= 120) {
+                appendLog(`High RTT sample ${Math.round(sample)}ms`);
+              }
             }
             pingRef.current.sentAt = 0;
           }
@@ -1197,12 +1227,14 @@ export default function Page() {
           localVisualPlayerRef.current = null;
           lastLocalCorrectionAtRef.current = 0;
           setGameStarted(false);
+          appendLog(`Game finished (${data?.reason || "done"})`);
           setStatus(`Match ended (${data?.reason || "done"})`);
         });
 
         usion.game.onError((data: AnyObj) => {
           if (data?.room_id && data.room_id !== activeRoomIdRef.current) return;
           const code = String(data?.code || "unknown");
+          appendLog(`Server error: ${code}`);
           setStatus(`Server error: ${code}`);
         });
       }
@@ -1210,10 +1242,12 @@ export default function Page() {
       let lastError: any = null;
       for (let attempt = 1; attempt <= JOIN_RETRY_LIMIT; attempt++) {
         try {
+          appendLog(`Connect attempt ${attempt}/${JOIN_RETRY_LIMIT}`);
           try { usion.game.disconnect?.(); } catch {}
           await sleep(100);
 
           await usion.game.connectDirect();
+          appendLog("Direct socket connected");
           const joinRes = await usion.game.join(rid);
           if (joinRes?.error) throw new Error(String(joinRes.error));
           const joinedPlayerId = String(joinRes?.player_id || "");
@@ -1233,6 +1267,7 @@ export default function Page() {
           setJoined(true);
           setPlayerCount((joinRes?.player_ids || []).length);
           const waiting = Number(joinRes?.waiting_for || 0);
+          appendLog(`Join OK, players ${(joinRes?.player_ids || []).length}/2`);
           setStatus(waiting > 0 ? `Waiting for ${waiting} player(s)...` : "Ready");
 
           lastError = null;
@@ -1240,6 +1275,7 @@ export default function Page() {
         } catch (err) {
           lastError = err;
           const msg = String((err as AnyObj)?.message || err);
+          appendLog(`Connect failed: ${msg}`);
           if (!msg.includes("1006") || attempt === JOIN_RETRY_LIMIT) throw err;
           setStatus(`Reconnecting (${attempt}/${JOIN_RETRY_LIMIT})...`);
           await sleep(JOIN_RETRY_BACKOFF_MS * attempt);
@@ -1248,12 +1284,22 @@ export default function Page() {
 
       if (lastError) throw lastError;
     } catch (err: any) {
+      appendLog(`Connection failed: ${String(err?.message || err)}`);
       setStatus(`Connection failed: ${String(err?.message || err)}`);
     } finally {
       connectGuardRef.current = false;
       setJoining(false);
     }
   }
+
+  useEffect(() => {
+    const now = performance.now();
+    if (perfHud.pendingInputs >= 8 && now - lastHighQueueLogAtRef.current > 2000) {
+      lastHighQueueLogAtRef.current = now;
+      appendLog(`Input queue high: q=${perfHud.pendingInputs}`);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [perfHud.pendingInputs]);
 
   const me = myId ? worldRef.current?.players?.[myId] : null;
 
@@ -1347,6 +1393,30 @@ export default function Page() {
           <span>Shoot: E</span>
           <span>Pickups: yellow W+</span>
           {me && <span>You HP {Math.round(me.hp)} SH {Math.round(me.shield)} W{Math.round(me.weaponLevel)}</span>}
+        </div>
+
+        <div
+          style={{
+            border: "1px solid rgba(56,189,248,0.2)",
+            borderRadius: 8,
+            padding: "6px 8px",
+            minHeight: 84,
+            maxHeight: 120,
+            overflowY: "auto",
+            background: "rgba(2,6,23,0.65)",
+            color: "#93c5fd",
+            fontSize: 11,
+            fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+            lineHeight: 1.35,
+          }}
+        >
+          {logLines.length === 0 ? (
+            <div>Logs will appear here...</div>
+          ) : (
+            logLines.map((line) => (
+              <div key={line.id}>[{line.ts}] {line.text}</div>
+            ))
+          )}
         </div>
       </div>
     </main>
