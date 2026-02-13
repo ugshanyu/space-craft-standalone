@@ -17,12 +17,22 @@ type PlayerState = {
   alive: boolean;
 };
 
+type ProjectileState = {
+  id: string;
+  x: number;
+  y: number;
+  ownerId: string;
+  vx: number;
+  vy: number;
+  ttlMs: number;
+};
+
 type WorldState = {
   phase: string;
   tick: number;
   remainingMs: number;
   players: Record<string, PlayerState>;
-  projectiles: Array<{ id: string; x: number; y: number }>;
+  projectiles: ProjectileState[];
   pickups: Array<{ id: string; x: number; y: number; type?: string }>;
 };
 
@@ -33,7 +43,7 @@ type SnapshotFrame = {
 };
 
 type InputPayload = { turn: number; thrust: number; fire: boolean };
-type PendingInput = { transportSeq: number; payload: InputPayload };
+type PendingInput = { transportSeq: number; payload: InputPayload; dtSec: number };
 
 declare global {
   interface Window {
@@ -48,6 +58,17 @@ const JOIN_RETRY_BACKOFF_MS = 600;
 const INPUT_SEND_MS = 33;
 const INTERP_DELAY_MS = 60;
 const UI_TICK_UPDATE_EVERY = 2;
+const MAX_PENDING_INPUTS = 120;
+const IMMEDIATE_INPUT_MIN_GAP_MS = 12;
+const UNSENT_PREDICTION_MAX_MS = INPUT_SEND_MS;
+const MAX_RENDER_DELTA_MS = 64;
+
+const FIRE_COOLDOWN_MS = 180;
+const PROJECTILE_SPEED = 60;
+const PROJECTILE_TTL_MS = 1100;
+const PROJECTILE_MUZZLE_OFFSET = 2;
+const PREDICTED_PROJECTILE_BRIDGE_MS = 450;
+const PROJECTILE_RECONCILE_DIST = 2.6;
 
 const TURN_RATE = 3.8;
 const ACCEL_FORWARD = 55;
@@ -81,6 +102,18 @@ function normalizeAngle(v: number): number {
   return n;
 }
 
+function toProjectile(raw: AnyObj): ProjectileState {
+  return {
+    id: String(raw?.id || ""),
+    x: Number(raw?.x || 0),
+    y: Number(raw?.y || 0),
+    ownerId: String(raw?.ownerId || ""),
+    vx: Number(raw?.vx || 0),
+    vy: Number(raw?.vy || 0),
+    ttlMs: Number(raw?.ttlMs || 0),
+  };
+}
+
 function cloneWorld(state: AnyObj): WorldState {
   const players: Record<string, PlayerState> = {};
   for (const [pid, p] of Object.entries(state?.players || {})) {
@@ -104,7 +137,7 @@ function cloneWorld(state: AnyObj): WorldState {
     tick: Number(state?.tick || 0),
     remainingMs: Number(state?.remainingMs || 0),
     players,
-    projectiles: (state?.projectiles || []).map((x: AnyObj) => ({ id: String(x.id || ""), x: Number(x.x || 0), y: Number(x.y || 0) })),
+    projectiles: (state?.projectiles || []).map((x: AnyObj) => toProjectile(x)),
     pickups: (state?.pickups || []).map((x: AnyObj) => ({ id: String(x.id || ""), x: Number(x.x || 0), y: Number(x.y || 0), type: String(x.type || "") })),
   };
 }
@@ -173,7 +206,7 @@ function mergeDelta(base: WorldState | null, data: AnyObj): WorldState | null {
     phase: changed.phase !== undefined ? String(changed.phase) : base.phase,
     remainingMs: changed.remainingMs !== undefined ? Number(changed.remainingMs) : base.remainingMs,
     players,
-    projectiles: projectiles.map((x) => ({ id: String(x.id || ""), x: Number(x.x || 0), y: Number(x.y || 0) })),
+    projectiles: projectiles.map((x: AnyObj) => toProjectile(x)),
     pickups,
   };
 
@@ -192,6 +225,35 @@ function lerpAngle(a: number, b: number, t: number): number {
   while (d > Math.PI) d -= Math.PI * 2;
   while (d < -Math.PI) d += Math.PI * 2;
   return a + d * t;
+}
+
+function torusDistanceSq(ax: number, ay: number, bx: number, by: number, size: number): number {
+  const dx = shortestWrapDelta(ax, bx, size);
+  const dy = shortestWrapDelta(ay, by, size);
+  return dx * dx + dy * dy;
+}
+
+function interpolateProjectiles(a: ProjectileState[], b: ProjectileState[], t: number): ProjectileState[] {
+  const prevById = new Map<string, ProjectileState>();
+  for (const item of a || []) prevById.set(item.id, item);
+
+  const out: ProjectileState[] = [];
+  for (const next of b || []) {
+    const prev = prevById.get(next.id);
+    if (!prev) {
+      out.push({ ...next });
+      continue;
+    }
+    out.push({
+      ...next,
+      x: wrap(prev.x + shortestWrapDelta(prev.x, next.x, 100) * t, 100),
+      y: wrap(prev.y + shortestWrapDelta(prev.y, next.y, 100) * t, 100),
+      vx: prev.vx + (next.vx - prev.vx) * t,
+      vy: prev.vy + (next.vy - prev.vy) * t,
+      ttlMs: prev.ttlMs + (next.ttlMs - prev.ttlMs) * t,
+    });
+  }
+  return out;
 }
 
 function interpolateWorld(a: WorldState, b: WorldState, t: number): WorldState {
@@ -230,18 +292,13 @@ function interpolateWorld(a: WorldState, b: WorldState, t: number): WorldState {
     tick: b.tick,
     remainingMs: b.remainingMs,
     players: outPlayers,
-    projectiles: b.projectiles,
+    projectiles: interpolateProjectiles(a.projectiles, b.projectiles, t),
     pickups: b.pickups,
   };
 }
 
-function applyLocalPrediction(state: WorldState, myId: string, input: InputPayload, dtSec: number): WorldState {
-  const me = state.players[myId];
-  if (!me || !me.alive) return state;
-
-  const pred = { ...state, players: { ...state.players, [myId]: { ...me } } };
-  const p = pred.players[myId];
-
+function applyInputToPlayer(base: PlayerState, input: InputPayload, dtSec: number): PlayerState {
+  const p = { ...base };
   p.angle = normalizeAngle(p.angle + input.turn * TURN_RATE * dtSec);
 
   if (input.thrust !== 0) {
@@ -264,7 +321,66 @@ function applyLocalPrediction(state: WorldState, myId: string, input: InputPaylo
   p.x = wrap(p.x + p.vx * dtSec, 100);
   p.y = wrap(p.y + p.vy * dtSec, 100);
 
+  return p;
+}
+
+function applyLocalPrediction(state: WorldState, myId: string, input: InputPayload, dtSec: number): WorldState {
+  const me = state.players[myId];
+  if (!me || !me.alive) return state;
+
+  const pred = { ...state, players: { ...state.players, [myId]: applyInputToPlayer(me, input, dtSec) } };
   return pred;
+}
+
+function advanceProjectile(projectile: ProjectileState, dtSec: number, maxAgeMs: number): ProjectileState {
+  return {
+    ...projectile,
+    x: wrap(projectile.x + projectile.vx * dtSec, 100),
+    y: wrap(projectile.y + projectile.vy * dtSec, 100),
+    ttlMs: Math.max(0, Math.min(maxAgeMs, projectile.ttlMs - dtSec * 1000)),
+  };
+}
+
+function makePredictedProjectile(myId: string, ship: PlayerState, id: string): ProjectileState {
+  return {
+    id,
+    ownerId: myId,
+    x: wrap(ship.x + Math.cos(ship.angle) * PROJECTILE_MUZZLE_OFFSET, 100),
+    y: wrap(ship.y + Math.sin(ship.angle) * PROJECTILE_MUZZLE_OFFSET, 100),
+    vx: Math.cos(ship.angle) * PROJECTILE_SPEED,
+    vy: Math.sin(ship.angle) * PROJECTILE_SPEED,
+    ttlMs: Math.min(PROJECTILE_TTL_MS, PREDICTED_PROJECTILE_BRIDGE_MS),
+  };
+}
+
+function reconcilePredictedProjectiles(
+  predicted: ProjectileState[],
+  authoritative: ProjectileState[],
+  myId: string,
+): ProjectileState[] {
+  const mine = (authoritative || []).filter((pr) => pr.ownerId === myId);
+  if (mine.length === 0) return predicted;
+
+  const maxDistSq = PROJECTILE_RECONCILE_DIST * PROJECTILE_RECONCILE_DIST;
+  const used = new Set<number>();
+  const out: ProjectileState[] = [];
+  for (const localShot of predicted) {
+    let matchIdx = -1;
+    for (let i = 0; i < mine.length; i++) {
+      if (used.has(i)) continue;
+      const serverShot = mine[i];
+      if (torusDistanceSq(localShot.x, localShot.y, serverShot.x, serverShot.y, 100) <= maxDistSq) {
+        matchIdx = i;
+        break;
+      }
+    }
+    if (matchIdx >= 0) {
+      used.add(matchIdx);
+    } else {
+      out.push(localShot);
+    }
+  }
+  return out;
 }
 
 export default function Page() {
@@ -294,35 +410,114 @@ export default function Page() {
   const myIdRef = useRef("");
   const lastUiTickRef = useRef(0);
   const lastHudUpdateRef = useRef(0);
+  const lastRenderAtRef = useRef<number | null>(null);
+  const localFireCooldownMsRef = useRef(0);
+  const predictedProjectilesRef = useRef<ProjectileState[]>([]);
+  const predictedProjectileSeqRef = useRef(0);
+  const lastInputSentAtRef = useRef(0);
+  const lastImmediateInputSentAtRef = useRef(0);
+  const joinedRef = useRef(false);
+  const gameStartedRef = useRef(false);
+  const sendImmediateInputRef = useRef<() => void>(() => {});
+
+  joinedRef.current = joined;
+  gameStartedRef.current = gameStarted;
 
   useEffect(() => {
     if (window.Usion?._initialized) return;
     window.Usion?.init?.();
   }, []);
 
+  function sendControlInput(usion: AnyObj, input: InputPayload, sentAtMs = performance.now()) {
+    usion.game.realtime("control", input);
+
+    const prevSentAt = lastInputSentAtRef.current || sentAtMs - INPUT_SEND_MS;
+    const dtSec = clamp((sentAtMs - prevSentAt) / 1000, 1 / 240, 0.12);
+    lastInputSentAtRef.current = sentAtMs;
+
+    const transportSeq = Number(usion?.game?._directSeq || 0);
+    if (transportSeq > 0) {
+      pendingInputsRef.current.push({ transportSeq, payload: input, dtSec });
+      if (pendingInputsRef.current.length > MAX_PENDING_INPUTS) {
+        pendingInputsRef.current.splice(0, pendingInputsRef.current.length - MAX_PENDING_INPUTS);
+      }
+    }
+  }
+
+  sendImmediateInputRef.current = () => {
+    if (!joinedRef.current || !gameStartedRef.current) return;
+
+    const usion = window.Usion;
+    if (!usion?.game) return;
+
+    const now = performance.now();
+    if (now - lastImmediateInputSentAtRef.current < IMMEDIATE_INPUT_MIN_GAP_MS) return;
+
+    sendControlInput(usion, buildInputFromKeys(keysRef.current), now);
+    lastImmediateInputSentAtRef.current = now;
+  };
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (isControlKey(event)) event.preventDefault();
+
       const k = event.key.toLowerCase();
-      if (k === "w" || event.key === "ArrowUp") keysRef.current.up = true;
-      if (k === "s" || event.key === "ArrowDown") keysRef.current.down = true;
-      if (k === "a" || event.key === "ArrowLeft") keysRef.current.left = true;
-      if (k === "d" || event.key === "ArrowRight") keysRef.current.right = true;
-      if (isFireKey(event)) keysRef.current.fire = true;
+      let changed = false;
+      if ((k === "w" || event.key === "ArrowUp") && !keysRef.current.up) {
+        keysRef.current.up = true;
+        changed = true;
+      }
+      if ((k === "s" || event.key === "ArrowDown") && !keysRef.current.down) {
+        keysRef.current.down = true;
+        changed = true;
+      }
+      if ((k === "a" || event.key === "ArrowLeft") && !keysRef.current.left) {
+        keysRef.current.left = true;
+        changed = true;
+      }
+      if ((k === "d" || event.key === "ArrowRight") && !keysRef.current.right) {
+        keysRef.current.right = true;
+        changed = true;
+      }
+      if (isFireKey(event) && !keysRef.current.fire) {
+        keysRef.current.fire = true;
+        changed = true;
+      }
+      if (changed) sendImmediateInputRef.current();
     };
 
     const onKeyUp = (event: KeyboardEvent) => {
       if (isControlKey(event)) event.preventDefault();
+
       const k = event.key.toLowerCase();
-      if (k === "w" || event.key === "ArrowUp") keysRef.current.up = false;
-      if (k === "s" || event.key === "ArrowDown") keysRef.current.down = false;
-      if (k === "a" || event.key === "ArrowLeft") keysRef.current.left = false;
-      if (k === "d" || event.key === "ArrowRight") keysRef.current.right = false;
-      if (isFireKey(event)) keysRef.current.fire = false;
+      let changed = false;
+      if ((k === "w" || event.key === "ArrowUp") && keysRef.current.up) {
+        keysRef.current.up = false;
+        changed = true;
+      }
+      if ((k === "s" || event.key === "ArrowDown") && keysRef.current.down) {
+        keysRef.current.down = false;
+        changed = true;
+      }
+      if ((k === "a" || event.key === "ArrowLeft") && keysRef.current.left) {
+        keysRef.current.left = false;
+        changed = true;
+      }
+      if ((k === "d" || event.key === "ArrowRight") && keysRef.current.right) {
+        keysRef.current.right = false;
+        changed = true;
+      }
+      if (isFireKey(event) && keysRef.current.fire) {
+        keysRef.current.fire = false;
+        changed = true;
+      }
+      if (changed) sendImmediateInputRef.current();
     };
 
     const onBlur = () => {
+      const hadInput = keysRef.current.up || keysRef.current.down || keysRef.current.left || keysRef.current.right || keysRef.current.fire;
       keysRef.current = { up: false, down: false, left: false, right: false, fire: false };
+      if (hadInput) sendImmediateInputRef.current();
     };
 
     window.addEventListener("keydown", onKeyDown);
@@ -354,16 +549,10 @@ export default function Page() {
     if (!usion?.game) return;
 
     if (gameStarted && joined && !inputTimerRef.current) {
+      lastInputSentAtRef.current = performance.now() - INPUT_SEND_MS;
       inputTimerRef.current = window.setInterval(() => {
         const input = buildInputFromKeys(keysRef.current);
-        usion.game.realtime("control", input);
-        const transportSeq = Number(usion?.game?._directSeq || 0);
-        if (transportSeq > 0) {
-          pendingInputsRef.current.push({ transportSeq, payload: input });
-          if (pendingInputsRef.current.length > 120) {
-            pendingInputsRef.current.splice(0, pendingInputsRef.current.length - 120);
-          }
-        }
+        sendControlInput(usion, input);
       }, INPUT_SEND_MS);
     }
 
@@ -377,6 +566,10 @@ export default function Page() {
     return () => {
       if (inputTimerRef.current) window.clearInterval(inputTimerRef.current);
       if (rafRef.current !== null) window.cancelAnimationFrame(rafRef.current);
+      predictedProjectilesRef.current = [];
+      pendingInputsRef.current = [];
+      localFireCooldownMsRef.current = 0;
+      lastRenderAtRef.current = null;
       try { window.Usion?.game?.disconnect?.(); } catch {}
     };
   }, []);
@@ -386,6 +579,11 @@ export default function Page() {
     if (!canvas) return;
 
     const now = performance.now();
+    const prevRenderAt = lastRenderAtRef.current ?? now - INPUT_SEND_MS;
+    const frameDtMs = clamp(now - prevRenderAt, 0, MAX_RENDER_DELTA_MS);
+    const frameDtSec = frameDtMs / 1000;
+    lastRenderAtRef.current = now;
+
     const target = now - INTERP_DELAY_MS;
     const snapshots = snapshotsRef.current;
 
@@ -418,6 +616,11 @@ export default function Page() {
 
     const myPid = myIdRef.current;
     if (myPid) {
+      predictedProjectilesRef.current = predictedProjectilesRef.current
+        .map((pr) => advanceProjectile(pr, frameDtSec, PREDICTED_PROJECTILE_BRIDGE_MS))
+        .filter((pr) => pr.ttlMs > 0);
+      localFireCooldownMsRef.current = Math.max(0, localFireCooldownMsRef.current - frameDtMs);
+
       const newest = snapshots[snapshots.length - 1]?.state;
       const newestMe = newest?.players?.[myPid];
       if (newestMe) {
@@ -430,8 +633,40 @@ export default function Page() {
         };
       }
       for (const pending of pendingInputsRef.current) {
-        renderState = applyLocalPrediction(renderState, myPid, pending.payload, INPUT_SEND_MS / 1000);
+        renderState = applyLocalPrediction(renderState, myPid, pending.payload, pending.dtSec);
       }
+
+      const unsentMs = clamp(now - lastInputSentAtRef.current, 0, UNSENT_PREDICTION_MAX_MS);
+      if (unsentMs > 0) {
+        renderState = applyLocalPrediction(renderState, myPid, buildInputFromKeys(keysRef.current), unsentMs / 1000);
+      }
+
+      if (joinedRef.current && gameStartedRef.current && keysRef.current.fire && localFireCooldownMsRef.current <= 0) {
+        const predictedMe = renderState.players[myPid];
+        if (predictedMe?.alive) {
+          predictedProjectileSeqRef.current += 1;
+          predictedProjectilesRef.current.push(
+            makePredictedProjectile(myPid, predictedMe, `pred:${myPid}:${predictedProjectileSeqRef.current}`),
+          );
+          localFireCooldownMsRef.current = FIRE_COOLDOWN_MS;
+        }
+      }
+
+      predictedProjectilesRef.current = reconcilePredictedProjectiles(
+        predictedProjectilesRef.current,
+        renderState.projectiles,
+        myPid,
+      );
+    } else if (predictedProjectilesRef.current.length > 0) {
+      predictedProjectilesRef.current = [];
+      localFireCooldownMsRef.current = 0;
+    }
+
+    if (predictedProjectilesRef.current.length > 0) {
+      renderState = {
+        ...renderState,
+        projectiles: [...renderState.projectiles, ...predictedProjectilesRef.current],
+      };
     }
 
     drawWorld(renderState, canvas, myPid);
@@ -521,6 +756,10 @@ export default function Page() {
     setJoining(true);
     setRoomId(rid);
     activeRoomIdRef.current = rid;
+    predictedProjectilesRef.current = [];
+    predictedProjectileSeqRef.current = 0;
+    localFireCooldownMsRef.current = 0;
+    lastRenderAtRef.current = null;
 
     const uid = String(usion.user?.getId?.() || "");
     myIdRef.current = uid;
@@ -538,8 +777,12 @@ export default function Page() {
             setMyId(joinedPlayerId);
           }
           pendingInputsRef.current = [];
+          predictedProjectilesRef.current = [];
+          predictedProjectileSeqRef.current = 0;
           lastAckSeqRef.current = 0;
           lastNetworkTickRef.current = 0;
+          lastInputSentAtRef.current = performance.now() - INPUT_SEND_MS;
+          localFireCooldownMsRef.current = 0;
           setJoined(true);
           setPlayerCount((data?.player_ids || []).length);
           const waiting = Number(data?.waiting_for || 0);
@@ -555,6 +798,9 @@ export default function Page() {
 
         usion.game.onGameStart((data: AnyObj) => {
           if (data?.room_id && data.room_id !== activeRoomIdRef.current) return;
+          lastInputSentAtRef.current = performance.now() - INPUT_SEND_MS;
+          localFireCooldownMsRef.current = 0;
+          predictedProjectilesRef.current = [];
           setGameStarted(true);
           setStatus("Fight");
         });
@@ -566,6 +812,8 @@ export default function Page() {
         usion.game.onGameFinished((data: AnyObj) => {
           if (data?.room_id && data.room_id !== activeRoomIdRef.current) return;
           pendingInputsRef.current = [];
+          predictedProjectilesRef.current = [];
+          localFireCooldownMsRef.current = 0;
           setGameStarted(false);
           setStatus(`Match ended (${data?.reason || "done"})`);
         });
@@ -592,6 +840,10 @@ export default function Page() {
             setMyId(joinedPlayerId);
           }
 
+          predictedProjectilesRef.current = [];
+          predictedProjectileSeqRef.current = 0;
+          localFireCooldownMsRef.current = 0;
+          lastInputSentAtRef.current = performance.now() - INPUT_SEND_MS;
           setJoined(true);
           setPlayerCount((joinRes?.player_ids || []).length);
           const waiting = Number(joinRes?.waiting_for || 0);
@@ -623,17 +875,17 @@ export default function Page() {
     <main
       style={{
         height: "100dvh",
+        width: "100vw",
         overflow: "hidden",
         background: "radial-gradient(circle at 20% 5%, #0b1732 0%, #030712 55%, #01040d 100%)",
-        display: "grid",
-        placeItems: "center",
-        padding: 14,
+        display: "block",
+        padding: 10,
         boxSizing: "border-box",
       }}
     >
       <div
         style={{
-          width: "min(980px, 100%)",
+          width: "100%",
           height: "100%",
           display: "grid",
           gridTemplateRows: "auto auto auto minmax(0, 1fr) auto",
@@ -691,7 +943,7 @@ export default function Page() {
             height={CANVAS_SIZE}
             style={{
               display: "block",
-              width: "min(calc(100dvh - 300px), calc(100vw - 64px), 760px)",
+              width: "min(calc(100dvh - 190px), calc(100vw - 30px))",
               height: "auto",
               aspectRatio: "1 / 1",
               maxHeight: "100%",
@@ -718,6 +970,13 @@ function drawWorld(world: WorldState, canvas: HTMLCanvasElement, myId: string) {
   const h = canvas.height;
   const sx = w / 100;
   const sy = h / 100;
+  const shipNose = 16;
+  const shipTail = 12;
+  const shipWing = 10;
+  const hpBarW = 38;
+  const hpBarY = 22;
+  const shieldBarY = 16;
+  const labelY = 29;
 
   const bg = ctx.createLinearGradient(0, 0, 0, h);
   bg.addColorStop(0, "#07132b");
@@ -778,31 +1037,30 @@ function drawWorld(world: WorldState, canvas: HTMLCanvasElement, myId: string) {
 
     ctx.fillStyle = p.alive ? (pid === myId ? "#22d3ee" : "#f59e0b") : "#64748b";
     ctx.beginPath();
-    ctx.moveTo(12, 0);
-    ctx.lineTo(-9, 7);
-    ctx.lineTo(-6, 0);
-    ctx.lineTo(-9, -7);
+    ctx.moveTo(shipNose, 0);
+    ctx.lineTo(-shipTail, shipWing);
+    ctx.lineTo(-shipTail * 0.66, 0);
+    ctx.lineTo(-shipTail, -shipWing);
     ctx.closePath();
     ctx.fill();
 
     ctx.restore();
 
-    const barW = 32;
     const hp = clamp(p.hp / 100, 0, 1);
     const sh = clamp(p.shield / 60, 0, 1);
 
     ctx.fillStyle = "rgba(15,23,42,0.8)";
-    ctx.fillRect(x - barW / 2, y - 18, barW, 4);
+    ctx.fillRect(x - hpBarW / 2, y - hpBarY, hpBarW, 4);
     ctx.fillStyle = "#22c55e";
-    ctx.fillRect(x - barW / 2, y - 18, barW * hp, 4);
+    ctx.fillRect(x - hpBarW / 2, y - hpBarY, hpBarW * hp, 4);
 
     ctx.fillStyle = "rgba(15,23,42,0.8)";
-    ctx.fillRect(x - barW / 2, y - 13, barW, 3);
+    ctx.fillRect(x - hpBarW / 2, y - shieldBarY, hpBarW, 3);
     ctx.fillStyle = "#60a5fa";
-    ctx.fillRect(x - barW / 2, y - 13, barW * sh, 3);
+    ctx.fillRect(x - hpBarW / 2, y - shieldBarY, hpBarW * sh, 3);
 
     ctx.fillStyle = "#e2e8f0";
     ctx.font = "bold 12px system-ui";
-    ctx.fillText(`${pid === myId ? "YOU" : "RIVAL"} W${Math.round(p.weaponLevel)}`, x - 20, y - 24);
+    ctx.fillText(`${pid === myId ? "YOU" : "RIVAL"} W${Math.round(p.weaponLevel)}`, x - 24, y - labelY);
   }
 }
