@@ -8,7 +8,7 @@ export const metadata: Metadata = {
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {
-  const sdkVersion = process.env.RAILWAY_GIT_COMMIT_SHA?.slice(0, 8) || "v3";
+  const sdkVersion = process.env.RAILWAY_GIT_COMMIT_SHA?.slice(0, 8) || "v4";
 
   return (
     <html lang="en">

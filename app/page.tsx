@@ -41,13 +41,10 @@ export default function Page() {
   const myUserIdRef = useRef<string>("");
 
   useEffect(() => {
-    const onInit = () => {
-      return;
-    };
     if (window.Usion?._initialized) {
-      onInit();
+      return;
     } else if (window.Usion) {
-      window.Usion.init(onInit);
+      window.Usion.init();
     }
   }, []);
 

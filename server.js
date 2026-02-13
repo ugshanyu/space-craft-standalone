@@ -22,46 +22,17 @@ const TICK_RATE_HZ = 20;
 const TICK_MS = 1000 / TICK_RATE_HZ;
 const SNAPSHOT_INTERVAL_TICKS = 20;
 const MIN_PLAYERS = 2;
-const WS_DIAG = false;
-const WS_INPUT_TRACE = false;
-const WS_DEBUG_PROBE = false;
-const WS_PROBE_GAME = false;
-const READY_STATE = ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'];
-let connectionSeq = 0;
 
 const rooms = new Map(); // roomId -> RoomRuntime
 
-function readyStateName(ws) {
-  return READY_STATE[ws.readyState] || String(ws.readyState);
-}
-
-function shortId(value, size = 8) {
-  if (!value) return '(none)';
-  const s = String(value);
-  return s.length > size ? s.slice(0, size) : s;
-}
-
-function diag(cid, event, details = undefined) {
-  if (!WS_DIAG) return;
-  if (details !== undefined) {
-    console.log(`[WS][${cid}] ${event}`, details);
-  } else {
-    console.log(`[WS][${cid}] ${event}`);
-  }
-}
-
-function sendJson(ws, cid, frame, label) {
+function sendJson(ws, frame) {
   const text = JSON.stringify(frame);
-  const state = readyStateName(ws);
   if (ws.readyState !== ws.OPEN) {
-    diag(cid, `send_skip:${label}`, { state, bytes: text.length });
     return false;
   }
   ws.send(text, (err) => {
     if (err) {
-      console.error(`[WS][${cid}] send_error:${label}`, err.message);
-    } else {
-      diag(cid, `send_ok:${label}`, { bytes: text.length });
+      console.error('[WS] send_error', err.message);
     }
   });
   return true;
@@ -301,36 +272,22 @@ async function fetchRoomInfo(roomId) {
   }
 }
 
-function handleMessage(ws, session, msg, ctx = {}) {
-  const cid = ctx.cid || 'na';
+function handleMessage(ws, session, msg) {
   const { type, payload } = msg;
   const topSeq = msg.seq || 0;
   const topTs = msg.ts || Date.now();
-
-  if (type !== 'input' || WS_INPUT_TRACE) {
-    diag(cid, 'message', {
-      type,
-      seq: topSeq,
-      ts: topTs,
-      sessionId: shortId(session.sessionId),
-      userId: shortId(session.userId),
-      roomId: shortId(session.roomId),
-      state: readyStateName(ws),
-    });
-  }
 
   if (type === 'join') {
     let room = rooms.get(session.roomId);
     if (!room) {
       room = new RoomRuntime(session.roomId, [], MIN_PLAYERS);
       rooms.set(session.roomId, room);
-      diag(cid, 'room_created', { roomId: session.roomId, minPlayers: room.minPlayers });
     }
 
     // Idempotent join: same session reconnect/join retries should not duplicate state.
     if (room.sessions.has(session.sessionId)) {
       const waitingFor = Math.max(0, room.minPlayers - room.connectedUserIds.size);
-      sendJson(ws, cid, {
+      sendJson(ws, {
         type: 'joined',
         payload: {
           room_id: session.roomId,
@@ -338,14 +295,13 @@ function handleMessage(ws, session, msg, ctx = {}) {
           player_ids: [...room.connectedUserIds],
           waiting_for: waitingFor,
         },
-      }, 'joined(idempotent)');
-      diag(cid, 'join_idempotent', { waitingFor, connected: room.connectedUserIds.size });
+      });
       return;
     }
 
     room.addSession(session.sessionId, session.userId, ws);
     const waitingFor = Math.max(0, room.minPlayers - room.connectedUserIds.size);
-    sendJson(ws, cid, {
+    sendJson(ws, {
       type: 'joined',
       payload: {
         room_id: session.roomId,
@@ -353,12 +309,6 @@ function handleMessage(ws, session, msg, ctx = {}) {
         player_ids: [...room.connectedUserIds],
         waiting_for: waitingFor,
       },
-    }, 'joined');
-    diag(cid, 'join_accepted', {
-      roomId: session.roomId,
-      connectedUsers: room.connectedUserIds.size,
-      sessions: room.sessions.size,
-      waitingFor,
     });
     room.broadcast('player_joined', {
       player_id: session.userId,
@@ -375,10 +325,6 @@ function handleMessage(ws, session, msg, ctx = {}) {
     
     const inputPayload = (payload && payload.action_data) || payload || {};
     const inputType = (payload && payload.action_type) || payload?.input_type || 'control';
-    
-    if (inputPayload.turn !== 0 || inputPayload.thrust !== 0 || inputPayload.fire) {
-      // console.log(`[INPUT] User=${session.userId} Type=${inputType}`);
-    }
 
     const result = room.enqueueInput(
       session.userId,
@@ -388,32 +334,26 @@ function handleMessage(ws, session, msg, ctx = {}) {
       topTs
     );
     if (!result.accepted) {
-      sendJson(ws, cid, { type: 'error', payload: { code: 'INPUT_REJECTED', ...result } }, 'input_rejected');
-      diag(cid, 'input_rejected', result);
-    } else if (WS_INPUT_TRACE && (inputPayload.turn !== 0 || inputPayload.thrust !== 0 || inputPayload.fire)) {
-      diag(cid, 'input_accepted', { seq: topSeq, queued: result.queued, inputType });
+      sendJson(ws, { type: 'error', payload: { code: 'INPUT_REJECTED', ...result } });
     }
   } else if (type === 'ping') {
     const room = rooms.get(session.roomId);
     const serverTick = room ? room.serverTick : 0;
-    sendJson(ws, cid, {
+    sendJson(ws, {
       type: 'pong',
       payload: {
         room_id: session.roomId,
         server_tick: serverTick,
         server_ts: Date.now(),
       },
-    }, 'pong');
+    });
   } else if (type === 'leave') {
     const room = rooms.get(session.roomId);
     if (room) {
       room.removeSession(session.sessionId);
       room.broadcast('player_left', { player_id: session.userId });
     }
-    diag(cid, 'leave_requested', { sessionId: shortId(session.sessionId), roomId: shortId(session.roomId) });
     ws.close();
-  } else {
-    diag(cid, 'unknown_message_type', { type });
   }
 }
 
@@ -423,275 +363,48 @@ app.prepare().then(() => {
     handle(req, res, parsedUrl);
   });
 
-  // Use noServer mode to avoid conflicts with Next.js WebSocket handling.
-  // Disable permessage-deflate to avoid proxy/transport edge cases that can
-  // cause abnormal close(1006) before first client message is processed.
   const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
-  const debugWss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
-  const probeGameWss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
 
-  // Manually handle upgrade requests - route game WS to our server, ignore Next.js internal WS
   server.on('upgrade', (request, socket, head) => {
-    const cid = `${Date.now().toString(36)}-${(++connectionSeq).toString(36)}`;
-    request.__cid = cid;
-
-    // Avoid matching query strings; only skip actual Next.js upgrade paths.
     const reqUrl = new URL(request.url || '/', `http://localhost:${PORT}`);
     if (reqUrl.pathname.startsWith('/_next/')) {
-      diag(cid, 'upgrade_skip_next', { path: reqUrl.pathname });
       return;
     }
 
-    if (reqUrl.pathname === '/debug-ws') {
-      if (!WS_DEBUG_PROBE) {
-        socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
-        socket.destroy();
-        return;
-      }
-      diag(cid, 'upgrade_debug_ws', {
-        url: request.url?.slice(0, 120),
-        origin: request.headers.origin || '(none)',
-      });
-      debugWss.handleUpgrade(request, socket, head, (ws) => {
-        debugWss.emit('connection', ws, request);
-      });
-      return;
-    }
-
-    if (reqUrl.pathname === '/probe-game') {
-      if (!WS_PROBE_GAME) {
-        socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
-        socket.destroy();
-        return;
-      }
-      diag(cid, 'upgrade_probe_game', {
-        url: request.url?.slice(0, 120),
-        origin: request.headers.origin || '(none)',
-      });
-      probeGameWss.handleUpgrade(request, socket, head, (ws) => {
-        probeGameWss.emit('connection', ws, request);
-      });
-      return;
-    }
-
-    // Dedicated game websocket endpoint. Keep "/" for backward compatibility
-    // while service realtime.ws_url is being migrated to "/ws".
-    if (reqUrl.pathname !== '/ws' && reqUrl.pathname !== '/') {
-      diag(cid, 'upgrade_skip_unknown', { path: reqUrl.pathname });
+    // Only accept the direct game websocket endpoint.
+    if (reqUrl.pathname !== '/ws') {
       socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
       socket.destroy();
       return;
     }
-
-    diag(cid, 'upgrade_request', {
-      url: request.url?.slice(0, 120),
-      path: reqUrl.pathname,
-      hasToken: !!reqUrl.searchParams.get('token'),
-      origin: request.headers.origin || '(none)',
-      ua: (request.headers['user-agent'] || '').slice(0, 120),
-      xff: request.headers['x-forwarded-for'] || '(none)',
-      via: request.headers.via || '(none)',
-      socketRemote: `${socket.remoteAddress || '(unknown)'}:${socket.remotePort || '(unknown)'}`,
-    });
 
     wss.handleUpgrade(request, socket, head, (ws) => {
       wss.emit('connection', ws, request);
     });
   });
 
-  debugWss.on('connection', async (ws, req) => {
-    const cid = req.__cid || `${Date.now().toString(36)}-${(++connectionSeq).toString(36)}`;
-    const openedAt = Date.now();
-    const reqUrl = new URL(req.url || '/', `http://localhost:${PORT}`);
-    const token = reqUrl.searchParams.get('token');
-
-    diag(cid, 'debug_connection_open', {
-      path: reqUrl.pathname,
-      hasToken: !!token,
-      readyState: readyStateName(ws),
-    });
-
-    sendJson(ws, cid, {
-      type: 'debug_connected',
-      payload: {
-        ts: Date.now(),
-        path: reqUrl.pathname,
-        has_token: !!token,
-      },
-    }, 'debug_connected');
-
-    if (token) {
-      try {
-        const payload = await validateAccessToken(token, {
-          jwksUrl: JWKS_URL,
-          expectedServiceId: SERVICE_ID,
-        });
-        sendJson(ws, cid, {
-          type: 'debug_token_ok',
-          payload: {
-            user_id: payload.sub,
-            room_id: payload.room_id,
-            session_id: payload.session_id,
-            iat: payload.iat,
-            exp: payload.exp,
-          },
-        }, 'debug_token_ok');
-      } catch (err) {
-        sendJson(ws, cid, {
-          type: 'debug_token_error',
-          payload: { message: err?.message || String(err) },
-        }, 'debug_token_error');
-      }
-    }
-
-    ws.on('message', (data) => {
-      sendJson(ws, cid, {
-        type: 'debug_echo',
-        payload: {
-          ts: Date.now(),
-          len: data.length || 0,
-          text: data.toString(),
-        },
-      }, 'debug_echo');
-    });
-
-    ws.on('close', (code, reasonBuf) => {
-      diag(cid, 'debug_closed', {
-        code,
-        reason: reasonBuf ? reasonBuf.toString() : '(none)',
-        uptimeMs: Date.now() - openedAt,
-      });
-    });
-
-    ws.on('error', (err) => {
-      console.error(`[WS][${cid}] debug_ws_error`, err.message);
-    });
-  });
-
-  probeGameWss.on('connection', (ws, req) => {
-    const cid = req.__cid || `${Date.now().toString(36)}-${(++connectionSeq).toString(36)}`;
-    const openedAt = Date.now();
-    const reqUrl = new URL(req.url || '/', `http://localhost:${PORT}`);
-    let joined = false;
-
-    diag(cid, 'probe_game_open', {
-      path: reqUrl.pathname,
-      readyState: readyStateName(ws),
-    });
-
-    sendJson(ws, cid, {
-      type: 'probe_ready',
-      payload: { ts: Date.now(), note: 'send {type:join,...} then expect probe_joined' },
-    }, 'probe_ready');
-
-    ws.on('message', (data) => {
-      let msg = null;
-      try {
-        msg = JSON.parse(data.toString());
-      } catch {
-        sendJson(ws, cid, {
-          type: 'probe_echo_raw',
-          payload: { ts: Date.now(), text: data.toString() },
-        }, 'probe_echo_raw');
-        return;
-      }
-
-      if (msg?.type === 'join') {
-        joined = true;
-        sendJson(ws, cid, {
-          type: 'probe_joined',
-          payload: {
-            room_id: msg.room_id || 'probe-room',
-            player_id: msg.session_id || 'probe-session',
-            player_ids: [msg.session_id || 'probe-session'],
-            waiting_for: 1,
-            ts: Date.now(),
-          },
-        }, 'probe_joined');
-        return;
-      }
-
-      if (msg?.type === 'ping') {
-        sendJson(ws, cid, {
-          type: 'pong',
-          payload: { ts: Date.now(), room_id: msg.room_id || 'probe-room', server_tick: 0 },
-        }, 'probe_pong');
-        return;
-      }
-
-      sendJson(ws, cid, {
-        type: 'probe_echo_json',
-        payload: { ts: Date.now(), received: msg, joined },
-      }, 'probe_echo_json');
-    });
-
-    ws.on('close', (code, reasonBuf) => {
-      diag(cid, 'probe_game_closed', {
-        code,
-        reason: reasonBuf ? reasonBuf.toString() : '(none)',
-        joined,
-        uptimeMs: Date.now() - openedAt,
-      });
-    });
-  });
-
   wss.on('connection', (ws, req) => {
-    const cid = req.__cid || `${Date.now().toString(36)}-${(++connectionSeq).toString(36)}`;
-    const openedAt = Date.now();
-    let messageCount = 0;
-    let bytesIn = 0;
-    let queuedCount = 0;
-
-    // Note: req.url includes the path, e.g., /?token=...
     const url = new URL(req.url, `http://localhost:${PORT}`);
     const token = url.searchParams.get('token');
     
     let session = { userId: null, roomId: null, sessionId: null };
-    let pendingMessages = []; 
+    let pendingMessages = [];
     let authComplete = false;
-    const authStartedAt = Date.now();
 
-    const tcp = ws._socket;
-    if (tcp) {
-      try {
-        tcp.setNoDelay(true);
-        tcp.setKeepAlive(true, 15000);
-      } catch {}
-      diag(cid, 'connection_open', {
-        remote: `${tcp.remoteAddress || '(unknown)'}:${tcp.remotePort || '(unknown)'}`,
-        local: `${tcp.localAddress || '(unknown)'}:${tcp.localPort || '(unknown)'}`,
-        encrypted: !!tcp.encrypted,
-        readyState: readyStateName(ws),
-      });
-      tcp.on('timeout', () => diag(cid, 'tcp_timeout'));
-      tcp.on('end', () => diag(cid, 'tcp_end'));
-      tcp.on('error', (err) => console.error(`[WS][${cid}] tcp_error`, err.message));
-      tcp.on('close', (hadError) => diag(cid, 'tcp_close', { hadError }));
-    } else {
-      diag(cid, 'connection_open', { note: 'no underlying tcp socket info', readyState: readyStateName(ws) });
-    }
-
-    // Register message handler FIRST, before any async operations
     ws.on('message', (data) => {
-      messageCount += 1;
-      bytesIn += data.length || 0;
-      diag(cid, 'frame_in', { len: data.length || 0, count: messageCount, authComplete, state: readyStateName(ws) });
       try {
         const msg = JSON.parse(data.toString());
         if (!authComplete) {
-          queuedCount += 1;
-          diag(cid, 'queue_pre_auth', { type: msg.type, queuedCount });
           pendingMessages.push(msg);
           return;
         }
-        handleMessage(ws, session, msg, { cid });
+        handleMessage(ws, session, msg);
       } catch (err) {
-        console.error(`[WS][${cid}] message_parse_error`, err.message);
+        console.error('[WS] message_parse_error', err.message);
       }
     });
 
-    ws.on('close', (code, reasonBuf) => {
-      const reason = reasonBuf ? reasonBuf.toString() : '';
+    ws.on('close', () => {
       if (session.roomId && session.sessionId) {
         const room = rooms.get(session.roomId);
         if (room) {
@@ -699,28 +412,14 @@ app.prepare().then(() => {
           room.broadcast('player_left', { player_id: session.userId });
         }
       }
-      diag(cid, 'closed', {
-        code,
-        reason: reason || '(none)',
-        user: session.userId || '(unknown)',
-        room: session.roomId || '(unknown)',
-        uptimeMs: Date.now() - openedAt,
-        framesIn: messageCount,
-        bytesIn,
-        queuedBeforeAuth: queuedCount,
-        activeRooms: rooms.size,
-        rssMb: Math.round(process.memoryUsage().rss / (1024 * 1024)),
-      });
     });
 
     ws.on('error', (err) => {
-      console.error(`[WS][${cid}] ws_error`, err.message);
+      console.error('[WS] ws_error', err.message);
     });
 
-    diag(cid, 'auth_start', { hasToken: !!token });
-
     if (!token) {
-      sendJson(ws, cid, { type: 'error', payload: { code: 'NO_TOKEN', message: 'Missing access token' } }, 'no_token');
+      sendJson(ws, { type: 'error', payload: { code: 'NO_TOKEN', message: 'Missing access token' } });
       ws.close();
       return;
     }
@@ -734,35 +433,18 @@ app.prepare().then(() => {
         session.roomId = payload.room_id;
         session.sessionId = payload.session_id;
         authComplete = true;
-        diag(cid, 'auth_ok', {
-          authMs: Date.now() - authStartedAt,
-          userId: payload.sub,
-          roomId: payload.room_id,
-          sessionId: payload.session_id,
-          jti: payload.jti,
-          iat: payload.iat,
-          exp: payload.exp,
-          state: readyStateName(ws),
-        });
-
-        // SDK does not require an auth_ok frame for direct mode.
-        // Keep the connection passive until the client sends "join".
-        if (ws.readyState !== ws.OPEN) {
-          diag(cid, 'auth_ok_socket_not_open', { readyState: readyStateName(ws) });
-          return;
-        }
+        if (ws.readyState !== ws.OPEN) return;
 
         if (pendingMessages.length > 0) {
-          diag(cid, 'process_queued', { count: pendingMessages.length });
           for (const msg of pendingMessages) {
-            handleMessage(ws, session, msg, { cid });
+            handleMessage(ws, session, msg);
           }
           pendingMessages = [];
         }
       })
       .catch((err) => {
-        console.error(`[WS][${cid}] auth_failed`, err.message);
-        sendJson(ws, cid, { type: 'error', payload: { code: 'INVALID_TOKEN', message: err.message } }, 'auth_failed');
+        console.error('[WS] auth_failed', err.message);
+        sendJson(ws, { type: 'error', payload: { code: 'INVALID_TOKEN', message: err.message } });
         ws.close();
       });
   });
