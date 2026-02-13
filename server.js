@@ -22,10 +22,10 @@ const TICK_RATE_HZ = 20;
 const TICK_MS = 1000 / TICK_RATE_HZ;
 const SNAPSHOT_INTERVAL_TICKS = 20;
 const MIN_PLAYERS = 2;
-const WS_DIAG = process.env.WS_DIAG !== '0';
-const WS_INPUT_TRACE = process.env.WS_INPUT_TRACE === '1';
-const WS_DEBUG_PROBE = process.env.WS_DEBUG_PROBE === '1';
-const WS_PROBE_GAME = process.env.WS_PROBE_GAME === '1';
+const WS_DIAG = false;
+const WS_INPUT_TRACE = false;
+const WS_DEBUG_PROBE = false;
+const WS_PROBE_GAME = false;
 const READY_STATE = ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'];
 let connectionSeq = 0;
 
@@ -101,7 +101,6 @@ class RoomRuntime {
     for (const pid of allPlayerIds) this.ackSeqByPlayer[pid] = 0;
     this.running = true;
     this.tickInterval = setInterval(() => this.tick(), TICK_MS);
-    console.log('[ROOM] Game started:', this.roomId, 'players:', allPlayerIds);
     this.broadcast('game_start', { player_ids: allPlayerIds, room_id: this.roomId });
   }
 
@@ -111,13 +110,11 @@ class RoomRuntime {
       clearInterval(this.tickInterval);
       this.tickInterval = null;
     }
-    console.log('[ROOM] Stopped:', this.roomId);
   }
 
   addSession(sessionId, userId, ws) {
     this.sessions.set(sessionId, { userId, ws });
     this.connectedUserIds.add(userId);
-    console.log(`[ROOM] Session added: room=${this.roomId} session=${sessionId} user=${userId} (${this.connectedUserIds.size}/${this.minPlayers} players)`);
   }
 
   removeSession(sessionId) {
@@ -161,7 +158,6 @@ class RoomRuntime {
       this.connectedUserIds.clear();
       this.inputQueue = [];
       rooms.delete(this.roomId);
-      console.log(`[ROOM] Closed room due to player disconnect: ${this.roomId}`);
       return;
     }
 
@@ -171,7 +167,6 @@ class RoomRuntime {
       this.connectedUserIds.clear();
       this.inputQueue = [];
       rooms.delete(this.roomId);
-      console.log(`[ROOM] Removed empty room: ${this.roomId}`);
     }
   }
 
@@ -286,7 +281,6 @@ function hashState(state) {
 }
 
 async function fetchRoomInfo(roomId) {
-  console.log(`[ROOM] Fetching room info for ${roomId} from ${API_URL}...`);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 5000); // 5s timeout
   try {
@@ -296,11 +290,9 @@ async function fetchRoomInfo(roomId) {
     });
     clearTimeout(timeout);
     if (!resp.ok) {
-      console.log(`[ROOM] Failed to fetch room info (${resp.status}), using fallback`);
       return null;
     }
     const data = await resp.json();
-    console.log(`[ROOM] Got room info:`, { playerCount: data.player_ids?.length, status: data.status });
     return data;
   } catch (err) {
     clearTimeout(timeout);
@@ -375,7 +367,6 @@ function handleMessage(ws, session, msg, ctx = {}) {
     });
 
     if (!room.running && room.connectedUserIds.size >= room.minPlayers) {
-      console.log(`[ROOM] All ${room.minPlayers} players connected, starting game in room ${session.roomId}`);
       room.start();
     }
   } else if (type === 'input') {
@@ -779,11 +770,5 @@ app.prepare().then(() => {
   server.listen(PORT, (err) => {
     if (err) throw err;
     console.log(`> Ready on http://localhost:${PORT}`);
-    console.log(`> WebSocket Server ready on ws://localhost:${PORT}`);
-    console.log(`> Config: SERVICE_ID=${SERVICE_ID} API_URL=${API_URL} JWKS_URL=${JWKS_URL}`);
-    console.log(`> NODE_ENV=${process.env.NODE_ENV || '(unset)'}`);
-    console.log(`> WS_DIAG=${WS_DIAG} WS_INPUT_TRACE=${WS_INPUT_TRACE}`);
-    console.log(`> WS_DEBUG_PROBE=${WS_DEBUG_PROBE}`);
-    console.log(`> WS_PROBE_GAME=${WS_PROBE_GAME}`);
   });
 });

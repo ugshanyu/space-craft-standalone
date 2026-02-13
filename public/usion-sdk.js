@@ -589,7 +589,6 @@
         type: 'LOG',
         msg: msg
       });
-      console.log('[Usion]', msg);
     },
 
     /**
@@ -957,18 +956,6 @@
           var separator = wsUrl.indexOf('?') === -1 ? '?' : '&';
           var urlWithToken = wsUrl + separator + 'token=' + encodeURIComponent(access.access_token);
           var openedAtMs = Date.now();
-          try {
-            var parsedWsUrl = new URL(wsUrl);
-            console.log('[SDK] Opening direct WS', {
-              host: parsedWsUrl.host,
-              path: parsedWsUrl.pathname,
-              room_id: access.room_id || Usion.config.roomId || null,
-              session_id: access.session_id || null,
-              protocol_version: access.protocol_version || null
-            });
-          } catch (e) {
-            console.log('[SDK] Opening direct WS', { ws_url: wsUrl });
-          }
           var ws = new WebSocket(urlWithToken);
           self.directSocket = ws;
 
@@ -983,21 +970,10 @@
           ws.onopen = function() {
             opened = true;
             clearTimeout(timeout);
-            console.log('[SDK] WebSocket onopen fired', {
-              readyState: ws.readyState,
-              elapsed_ms: Date.now() - openedAtMs,
-              online: typeof navigator !== 'undefined' ? navigator.onLine : null,
-              visibility: typeof document !== 'undefined' ? document.visibilityState : null
-            });
             resolve();
           };
 
           ws.onerror = function(evt) {
-            console.log('[SDK] WebSocket onerror', {
-              readyState: ws.readyState,
-              elapsed_ms: Date.now() - openedAtMs,
-              event_type: evt && evt.type ? evt.type : '(unknown)'
-            });
             if (!opened) {
               clearTimeout(timeout);
               reject(new Error('Direct WebSocket connection error'));
@@ -1006,13 +982,6 @@
 
           ws.onclose = function(evt) {
             self._stopDirectKeepAlive();
-            console.log('[SDK] WebSocket onclose', {
-              code: evt && evt.code !== undefined ? evt.code : null,
-              reason: evt && evt.reason ? evt.reason : '',
-              wasClean: evt && evt.wasClean !== undefined ? evt.wasClean : null,
-              readyState: ws.readyState,
-              elapsed_ms: Date.now() - openedAtMs
-            });
             self.connected = false;
             self._joined = false;
             self._joinPromise = null;
@@ -1034,16 +1003,6 @@
           };
 
           ws.onmessage = function(evt) {
-            try {
-              var frame = evt && evt.data ? JSON.parse(evt.data) : null;
-              if (frame && frame.type && frame.type !== 'state_delta' && frame.type !== 'state_snapshot') {
-                console.log('[SDK] WebSocket onmessage', {
-                  type: frame.type,
-                  readyState: ws.readyState,
-                  elapsed_ms: Date.now() - openedAtMs
-                });
-              }
-            } catch (e) {}
             self._handleDirectMessage(evt && evt.data);
           };
         });
@@ -1056,20 +1015,17 @@
           if (!self.directMode || !self.directSocket || self.directSocket.readyState !== WebSocket.OPEN) return;
           self._sendDirect('ping', { source: 'sdk_keepalive', client_ts: Date.now() });
         }, self._directKeepAliveIntervalMs);
-        console.log('[SDK] Direct keepalive started', { interval_ms: self._directKeepAliveIntervalMs });
       },
 
       _stopDirectKeepAlive: function() {
         if (this._directKeepAliveTimer) {
           clearInterval(this._directKeepAliveTimer);
           this._directKeepAliveTimer = null;
-          console.log('[SDK] Direct keepalive stopped');
         }
       },
 
       _sendDirect: function(type, payload) {
         if (!this.directSocket || this.directSocket.readyState !== WebSocket.OPEN) {
-          console.log(`[SDK] _sendDirect FAILED: type=${type} socket_state=${this.directSocket ? this.directSocket.readyState : 'null'}`);
           return;
         }
         this._directSeq = this._directSeq + 1;
@@ -1082,7 +1038,6 @@
           protocol_version: (this.directConfig && this.directConfig.protocol_version) ? this.directConfig.protocol_version : '2',
           payload: payload || {}
         };
-        console.log(`[SDK] _sendDirect: type=${type} seq=${this._directSeq}`, msg);
         this.directSocket.send(JSON.stringify(msg));
       },
 

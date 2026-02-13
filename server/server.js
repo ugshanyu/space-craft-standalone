@@ -21,7 +21,7 @@ const SIGNING_SECRET = process.env.SIGNING_SECRET || 'CHANGE_ME_IN_PRODUCTION';
 const TICK_RATE_HZ = 20;
 const TICK_MS = 1000 / TICK_RATE_HZ;
 const SNAPSHOT_INTERVAL_TICKS = 20;
-const WS_DEBUG_PROBE = process.env.WS_DEBUG_PROBE === '1';
+const WS_DEBUG_PROBE = false;
 
 const rooms = new Map(); // roomId -> RoomRuntime
 
@@ -55,7 +55,6 @@ class RoomRuntime {
     for (const pid of allPlayerIds) this.ackSeqByPlayer[pid] = 0;
     this.running = true;
     this.tickInterval = setInterval(() => this.tick(), TICK_MS);
-    console.log('[ROOM] Game started:', this.roomId, 'players:', allPlayerIds);
     // Notify all clients that the game is starting
     this.broadcast('game_start', { player_ids: allPlayerIds, room_id: this.roomId });
   }
@@ -66,13 +65,11 @@ class RoomRuntime {
       clearInterval(this.tickInterval);
       this.tickInterval = null;
     }
-    console.log('[ROOM] Stopped:', this.roomId);
   }
 
   addSession(sessionId, userId, ws) {
     this.sessions.set(sessionId, { userId, ws });
     this.connectedUserIds.add(userId);
-    console.log(`[ROOM] Session added: room=${this.roomId} session=${sessionId} user=${userId} (${this.connectedUserIds.size}/${this.minPlayers} players)`);
   }
 
   removeSession(sessionId) {
@@ -114,7 +111,6 @@ class RoomRuntime {
       this.connectedUserIds.clear();
       this.inputQueue = [];
       rooms.delete(this.roomId);
-      console.log(`[ROOM] Closed room due to player disconnect: ${this.roomId}`);
       return;
     }
 
@@ -123,7 +119,6 @@ class RoomRuntime {
       this.connectedUserIds.clear();
       this.inputQueue = [];
       rooms.delete(this.roomId);
-      console.log(`[ROOM] Removed empty room: ${this.roomId}`);
     }
   }
 
@@ -319,8 +314,7 @@ wss.on('connection', (ws, req) => {
       session.sessionId = payload.session_id;
       authComplete = true;
       const now = Math.floor(Date.now() / 1000);
-      console.log('[WS] Connection authenticated:', session);
-      console.log('[WS] Token timestamps: iat=', payload.iat, 'exp=', payload.exp, 'now=', now, 'remaining=', payload.exp - now, 'seconds');
+      
 
       // SDK does not require an auth_ok frame for direct mode.
       // Keep connection open and wait for client "join".
@@ -328,7 +322,6 @@ wss.on('connection', (ws, req) => {
 
       // Process any messages that arrived while authenticating
       if (pendingMessages.length > 0) {
-        console.log(`[WS] Processing ${pendingMessages.length} queued message(s)`);
         for (const msg of pendingMessages) {
           handleMessage(ws, session, msg);
         }
@@ -364,7 +357,6 @@ wss.on('connection', (ws, req) => {
         room.broadcast('player_left', { player_id: session.userId });
       }
     }
-    console.log('[WS] Connection closed:', session);
   });
 
   ws.on('error', (err) => {
@@ -378,11 +370,9 @@ async function fetchRoomInfo(roomId) {
       headers: { 'Content-Type': 'application/json' },
     });
     if (!resp.ok) {
-      console.log(`[ROOM] Failed to fetch room info (${resp.status}), using single-player fallback`);
       return null;
     }
     const data = await resp.json();
-    console.log('[ROOM] Fetched room info:', { roomId, playerIds: data.player_ids, status: data.status });
     return data;
   } catch (err) {
     console.error('[ROOM] Error fetching room info:', err.message);
@@ -401,7 +391,6 @@ function handleMessage(ws, session, msg) {
     if (!room) {
       room = new RoomRuntime(session.roomId, [], MIN_PLAYERS);
       rooms.set(session.roomId, room);
-      console.log(`[ROOM] Created room ${session.roomId} with minPlayers=${room.minPlayers}`);
     }
 
     // Idempotent join for retries/reconnect races.
@@ -440,7 +429,6 @@ function handleMessage(ws, session, msg) {
 
     // Start if enough unique players are now connected
     if (!room.running && room.connectedUserIds.size >= room.minPlayers) {
-      console.log(`[ROOM] All ${room.minPlayers} players connected, starting game in room ${session.roomId}`);
       room.start();
     }
   } else if (type === 'input') {
@@ -452,7 +440,6 @@ function handleMessage(ws, session, msg) {
     
     // Only log if there is an actual action (non-zero)
     if (inputPayload.turn !== 0 || inputPayload.thrust !== 0 || inputPayload.fire) {
-      console.log(`[INPUT] User=${session.userId} Type=${inputType} Data=`, JSON.stringify(inputPayload));
     }
 
     const result = room.enqueueInput(
@@ -487,7 +474,3 @@ function handleMessage(ws, session, msg) {
 }
 
 console.log(`[SERVER] Space Craft Direct Mode WebSocket Server running on port ${PORT}`);
-console.log(`[SERVER] Service ID: ${SERVICE_ID}`);
-console.log(`[SERVER] JWKS URL: ${JWKS_URL}`);
-console.log(`[SERVER] API URL: ${API_URL}`);
-console.log(`[SERVER] WS_DEBUG_PROBE: ${WS_DEBUG_PROBE}`);

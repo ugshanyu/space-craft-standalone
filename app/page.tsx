@@ -38,13 +38,11 @@ export default function Page() {
   const isConnectingRef = useRef(false);
   const handlersBoundRef = useRef(false);
   const activeRoomIdRef = useRef<string>("");
+  const myUserIdRef = useRef<string>("");
 
   useEffect(() => {
     const onInit = () => {
-      const usion = window.Usion;
-      if (usion?._initialized) {
-        console.log("[Direct] SDK initialized, config:", usion.config);
-      }
+      return;
     };
     if (window.Usion?._initialized) {
       onInit();
@@ -172,6 +170,7 @@ export default function Page() {
     setRoomId(rid);
     activeRoomIdRef.current = rid;
     const uid = String(usion.user?.getId?.() || "");
+    myUserIdRef.current = uid;
     setMyId(uid);
     setStatus("Connecting to direct server...");
     isConnectingRef.current = true;
@@ -184,8 +183,7 @@ export default function Page() {
         // Setup event handlers once so reload retries do not stack duplicate listeners.
         usion.game.onJoined((data: AnyObj) => {
           if (data?.room_id && data.room_id !== activeRoomIdRef.current) return;
-          console.log("[Direct] Joined:", data);
-          const pids = data.player_ids || [];
+          const pids = Array.from(new Set((data.player_ids || []).map(String)));
           const waiting = Number(data.waiting_for || 0);
           setJoined(true);
           setPlayerCount(pids.length);
@@ -200,8 +198,13 @@ export default function Page() {
         if (usion.game.onPlayerJoined) {
           usion.game.onPlayerJoined((data: AnyObj) => {
             if (data?.room_id && data.room_id !== activeRoomIdRef.current) return;
-            console.log("[Direct] Player joined:", data);
-            const pids = data.player_ids || [];
+            const pids = Array.from(new Set((data.player_ids || []).map(String)));
+            const joinedPlayerId = String(data.player_id || "");
+            // Server broadcasts player_joined to everyone including the joiner.
+            // Ignore self-echo when still alone to avoid sticky "waiting" status.
+            if (joinedPlayerId && joinedPlayerId === myUserIdRef.current && pids.length <= 1) {
+              return;
+            }
             const waiting = data.waiting_for !== undefined
               ? Number(data.waiting_for || 0)
               : Math.max(0, 2 - pids.length);
@@ -217,7 +220,6 @@ export default function Page() {
 
         usion.game.onGameStart((data: AnyObj) => {
           if (data?.room_id && data.room_id !== activeRoomIdRef.current) return;
-          console.log("[Direct] Game started!", data);
           setGameStarted(true);
           setPlayerCount((data.player_ids || []).length);
           setWaitingFor(0);
@@ -262,7 +264,6 @@ export default function Page() {
 
       let lastErr: any = null;
       for (let attempt = 1; attempt <= JOIN_RETRY_LIMIT; attempt++) {
-        console.log("[Direct] connect/join attempt", { attempt, roomId: rid, userId: uid });
         try {
           try { usion.game.disconnect?.(); } catch {}
           await sleep(120);
@@ -281,13 +282,11 @@ export default function Page() {
           } else {
             setStatus("All players connected!");
           }
-          console.log("[Direct] connect/join success", { attempt, roomId: rid, waitingFor: waiting, playerCount: pids.length });
           lastErr = null;
           break;
         } catch (err: any) {
           lastErr = err;
           const msg = String(err?.message || err);
-          console.warn("[Direct] connect/join attempt failed", { attempt, roomId: rid, error: msg });
           try { usion.game.disconnect?.(); } catch {}
           if (!msg.includes("code=1006") || attempt === JOIN_RETRY_LIMIT) {
             throw err;
@@ -300,7 +299,6 @@ export default function Page() {
       if (lastErr) throw lastErr;
     } catch (err: any) {
       setStatus(`Connection failed: ${err.message || String(err)}`);
-      console.error("[Direct] Connection error:", err);
     } finally {
       isConnectingRef.current = false;
       setJoining(false);
@@ -309,43 +307,10 @@ export default function Page() {
 
   useEffect(() => {
     return () => {
-      console.log("[Direct] page unmount cleanup");
       if (inputTimerRef.current) window.clearInterval(inputTimerRef.current);
       try {
         window.Usion?.game?.disconnect?.();
       } catch {}
-    };
-  }, []);
-
-  useEffect(() => {
-    const onVisibility = () => {
-      console.log("[Direct] visibilitychange", { state: document.visibilityState, ts: Date.now() });
-    };
-    const onPageHide = (e: PageTransitionEvent) => {
-      console.log("[Direct] pagehide", { persisted: e.persisted, ts: Date.now() });
-    };
-    const onBeforeUnload = () => {
-      console.log("[Direct] beforeunload", { ts: Date.now() });
-    };
-    const onOnline = () => {
-      console.log("[Direct] online", { ts: Date.now() });
-    };
-    const onOffline = () => {
-      console.log("[Direct] offline", { ts: Date.now() });
-    };
-
-    document.addEventListener("visibilitychange", onVisibility);
-    window.addEventListener("pagehide", onPageHide);
-    window.addEventListener("beforeunload", onBeforeUnload);
-    window.addEventListener("online", onOnline);
-    window.addEventListener("offline", onOffline);
-
-    return () => {
-      document.removeEventListener("visibilitychange", onVisibility);
-      window.removeEventListener("pagehide", onPageHide);
-      window.removeEventListener("beforeunload", onBeforeUnload);
-      window.removeEventListener("online", onOnline);
-      window.removeEventListener("offline", onOffline);
     };
   }, []);
 
