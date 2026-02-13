@@ -53,6 +53,8 @@ type InputPayload = {
 };
 type PendingInput = { transportSeq: number; payload: InputPayload; dtSec: number };
 type PerfHud = { fps: number; netGapMs: number; jitterMs: number; pendingInputs: number };
+type NetDebugHud = { mode: string; transport: string; rttMs: number | null };
+type ServerDebugHud = { region: string; simHz: number | null; netHz: number | null };
 
 declare global {
   interface Window {
@@ -547,6 +549,8 @@ export default function Page() {
   const [playerCount, setPlayerCount] = useState(0);
   const [serverTick, setServerTick] = useState(0);
   const [perfHud, setPerfHud] = useState<PerfHud>({ fps: 0, netGapMs: 0, jitterMs: 0, pendingInputs: 0 });
+  const [netDebugHud, setNetDebugHud] = useState<NetDebugHud>({ mode: "unknown", transport: "-", rttMs: null });
+  const [serverDebugHud, setServerDebugHud] = useState<ServerDebugHud>({ region: "-", simHz: null, netHz: null });
 
   const worldRef = useRef<WorldState | null>(null);
   const snapshotsRef = useRef<SnapshotFrame[]>([]);
@@ -557,6 +561,8 @@ export default function Page() {
 
   const inputTimerRef = useRef<number | null>(null);
   const perfHudTimerRef = useRef<number | null>(null);
+  const netDebugTimerRef = useRef<number | null>(null);
+  const pingTimerRef = useRef<number | null>(null);
   const rafRef = useRef<number | null>(null);
   const connectGuardRef = useRef(false);
   const handlersBoundRef = useRef(false);
@@ -579,6 +585,7 @@ export default function Page() {
   const sendImmediateInputRef = useRef<() => void>(() => {});
   const netStatsRef = useRef({ lastPacketAt: 0, emaGapMs: 0, jitterMs: 0 });
   const fpsWindowRef = useRef({ startedAt: 0, frames: 0 });
+  const pingRef = useRef({ sentAt: 0, emaRttMs: 0 });
 
   joinedRef.current = joined;
   gameStartedRef.current = gameStarted;
@@ -751,6 +758,56 @@ export default function Page() {
   }, []);
 
   useEffect(() => {
+    netDebugTimerRef.current = window.setInterval(() => {
+      const game = window.Usion?.game;
+      if (!game) {
+        setNetDebugHud((prev) => ({ ...prev, mode: "sdk-missing", transport: "-" }));
+        return;
+      }
+
+      let mode = "idle";
+      let transport = "-";
+      if (game.directMode) {
+        mode = "direct";
+        transport = "websocket";
+      } else if (game._useProxy) {
+        mode = "proxy";
+        transport = "rn-bridge";
+      } else if (game.socket) {
+        mode = "socket.io";
+        transport = String(game.socket?.io?.engine?.transport?.name || "socket.io");
+      }
+
+      const rttMs = pingRef.current.emaRttMs > 0 ? Math.round(pingRef.current.emaRttMs) : null;
+      setNetDebugHud({ mode, transport, rttMs });
+    }, 500);
+
+    return () => {
+      if (netDebugTimerRef.current !== null) {
+        window.clearInterval(netDebugTimerRef.current);
+        netDebugTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    const usion = window.Usion;
+    if (!usion?.game || !joined || !gameStarted) return;
+
+    pingTimerRef.current = window.setInterval(() => {
+      pingRef.current.sentAt = performance.now();
+      usion.game.requestSync?.(lastAckSeqRef.current || 0);
+    }, 1500);
+
+    return () => {
+      if (pingTimerRef.current !== null) {
+        window.clearInterval(pingTimerRef.current);
+        pingTimerRef.current = null;
+      }
+    };
+  }, [joined, gameStarted]);
+
+  useEffect(() => {
     const usion = window.Usion;
     if (!usion?.game) return;
 
@@ -773,6 +830,8 @@ export default function Page() {
     return () => {
       if (inputTimerRef.current) window.clearInterval(inputTimerRef.current);
       if (perfHudTimerRef.current) window.clearInterval(perfHudTimerRef.current);
+      if (netDebugTimerRef.current) window.clearInterval(netDebugTimerRef.current);
+      if (pingTimerRef.current) window.clearInterval(pingTimerRef.current);
       if (rafRef.current !== null) window.cancelAnimationFrame(rafRef.current);
       predictedProjectilesRef.current = [];
       localFireSeqRef.current = 0;
@@ -783,6 +842,7 @@ export default function Page() {
       localVisualPlayerRef.current = null;
       lastLocalCorrectionAtRef.current = 0;
       netStatsRef.current = { lastPacketAt: 0, emaGapMs: 0, jitterMs: 0 };
+      pingRef.current = { sentAt: 0, emaRttMs: 0 };
       try { window.Usion?.game?.disconnect?.(); } catch {}
     };
   }, []);
@@ -930,6 +990,13 @@ export default function Page() {
 
   function onNetworkState(data: AnyObj) {
     if (!data || data.room_id !== activeRoomIdRef.current) return;
+    if (data.deploy_region || data.sim_hz || data.net_hz) {
+      setServerDebugHud({
+        region: String(data.deploy_region || "-"),
+        simHz: Number.isFinite(Number(data.sim_hz)) ? Number(data.sim_hz) : null,
+        netHz: Number.isFinite(Number(data.net_hz)) ? Number(data.net_hz) : null,
+      });
+    }
     const packetNow = performance.now();
     if (netStatsRef.current.lastPacketAt > 0) {
       const gapMs = packetNow - netStatsRef.current.lastPacketAt;
@@ -1040,6 +1107,13 @@ export default function Page() {
 
         usion.game.onJoined((data: AnyObj) => {
           if (data?.room_id && data.room_id !== activeRoomIdRef.current) return;
+          if (data.deploy_region || data.sim_hz || data.net_hz) {
+            setServerDebugHud({
+              region: String(data.deploy_region || "-"),
+              simHz: Number.isFinite(Number(data.sim_hz)) ? Number(data.sim_hz) : null,
+              netHz: Number.isFinite(Number(data.net_hz)) ? Number(data.net_hz) : null,
+            });
+          }
           const joinedPlayerId = String(data?.player_id || "");
           if (joinedPlayerId) {
             myIdRef.current = joinedPlayerId;
@@ -1071,6 +1145,13 @@ export default function Page() {
 
         usion.game.onGameStart((data: AnyObj) => {
           if (data?.room_id && data.room_id !== activeRoomIdRef.current) return;
+          if (data.deploy_region || data.sim_hz || data.net_hz) {
+            setServerDebugHud({
+              region: String(data.deploy_region || "-"),
+              simHz: Number.isFinite(Number(data.sim_hz)) ? Number(data.sim_hz) : null,
+              netHz: Number.isFinite(Number(data.net_hz)) ? Number(data.net_hz) : null,
+            });
+          }
           lastInputSentAtRef.current = performance.now() - INPUT_SEND_MS;
           localFireCooldownMsRef.current = 0;
           predictedProjectilesRef.current = [];
@@ -1084,6 +1165,26 @@ export default function Page() {
 
         usion.game.onStateUpdate((data: AnyObj) => {
           onNetworkState(data);
+        });
+
+        usion.game.onSync((data: AnyObj) => {
+          if (data?.room_id && data.room_id !== activeRoomIdRef.current) return;
+          if (data.deploy_region || data.sim_hz || data.net_hz) {
+            setServerDebugHud({
+              region: String(data.deploy_region || "-"),
+              simHz: Number.isFinite(Number(data.sim_hz)) ? Number(data.sim_hz) : null,
+              netHz: Number.isFinite(Number(data.net_hz)) ? Number(data.net_hz) : null,
+            });
+          }
+          const sentAt = pingRef.current.sentAt;
+          if (sentAt > 0) {
+            const sample = performance.now() - sentAt;
+            if (sample > 0 && sample < 5000) {
+              const prev = pingRef.current.emaRttMs || sample;
+              pingRef.current.emaRttMs = prev * 0.75 + sample * 0.25;
+            }
+            pingRef.current.sentAt = 0;
+          }
         });
 
         usion.game.onGameFinished((data: AnyObj) => {
@@ -1187,6 +1288,8 @@ export default function Page() {
           <div style={{ fontSize: 11, opacity: 0.9, textAlign: "right", lineHeight: 1.35 }}>
             <div>Tick {serverTick}</div>
             <div>FPS {perfHud.fps} | gap {perfHud.netGapMs}ms | jitter {perfHud.jitterMs}ms | q {perfHud.pendingInputs}</div>
+            <div>net {netDebugHud.mode} | tx {netDebugHud.transport} | rtt {netDebugHud.rttMs ?? "-"}ms</div>
+            <div>srv {serverDebugHud.region} | sim {serverDebugHud.simHz ?? "-"} | net {serverDebugHud.netHz ?? "-"}</div>
           </div>
         </div>
 

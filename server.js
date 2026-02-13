@@ -27,6 +27,11 @@ const NETWORK_EVERY_SIM_TICKS = Math.max(1, Math.floor(SIM_TICK_HZ / NETWORK_HZ)
 const FULL_SNAPSHOT_INTERVAL_NET_TICKS = Math.max(1, Number(process.env.FULL_SNAPSHOT_INTERVAL_NET_TICKS || NETWORK_HZ));
 const MAX_LAG_COMP_MS = 120;
 const MAX_CLIENT_INPUT_AGE_MS = 2000;
+const NET_PROFILE = {
+  deploy_region: DEPLOY_REGION,
+  sim_hz: SIM_TICK_HZ,
+  net_hz: NETWORK_HZ,
+};
 
 const rooms = new Map();
 
@@ -175,6 +180,7 @@ class RoomRuntime {
     this.broadcast('game_start', {
       room_id: this.roomId,
       player_ids: players,
+      ...NET_PROFILE,
     });
 
     this.tickHandle = setInterval(() => this.tick(), SIM_TICK_MS);
@@ -212,6 +218,7 @@ class RoomRuntime {
         server_ts: Date.now(),
         server_tick: this.serverTick,
         ack_seq_by_player: this.ackSeqByPlayer,
+        ...NET_PROFILE,
       };
 
       const shouldSendFullSnapshot = (
@@ -464,6 +471,7 @@ function handleMessage(ws, session, msg) {
         player_id: session.userId,
         player_ids: room.activePlayers,
         waiting_for: waitingFor,
+        ...NET_PROFILE,
       },
     });
 
@@ -495,6 +503,7 @@ function handleMessage(ws, session, msg) {
         room_id: session.roomId,
         server_tick: room?.serverTick || 0,
         server_ts: Date.now(),
+        ...NET_PROFILE,
       },
     });
     return;
