@@ -22,7 +22,7 @@ const DEPLOY_REGION = process.env.RAILWAY_REGION || process.env.AWS_REGION || pr
 const MIN_PLAYERS = 2;
 const SIM_TICK_HZ = 60;
 const SIM_TICK_MS = Math.floor(1000 / SIM_TICK_HZ);
-const NETWORK_HZ = Math.max(1, Number(process.env.NETWORK_HZ || 30));
+const NETWORK_HZ = Math.max(1, Number(process.env.NETWORK_HZ || 60));
 const NETWORK_EVERY_SIM_TICKS = Math.max(1, Math.floor(SIM_TICK_HZ / NETWORK_HZ));
 const FULL_SNAPSHOT_INTERVAL_NET_TICKS = Math.max(1, Number(process.env.FULL_SNAPSHOT_INTERVAL_NET_TICKS || NETWORK_HZ));
 const MAX_LAG_COMP_MS = 120;
@@ -65,6 +65,7 @@ class RoomRuntime {
     this.running = false;
     this.finished = false;
     this.tickHandle = null;
+    this.lastTickTime = null; // hrtime for accurate delta
 
     this.serverTick = 0;
     this.networkTick = 0;
@@ -183,20 +184,40 @@ class RoomRuntime {
       ...NET_PROFILE,
     });
 
-    this.tickHandle = setInterval(() => this.tick(), SIM_TICK_MS);
+    this.lastTickTime = process.hrtime.bigint();
+    this._scheduleNextTick();
+  }
+
+  _scheduleNextTick() {
+    if (!this.running || this.finished) return;
+    const now = process.hrtime.bigint();
+    const elapsedSinceTickStartNs = Number(now - this.lastTickTime);
+    const targetNs = SIM_TICK_MS * 1_000_000;
+    // Target: next tick fires SIM_TICK_MS after the current tick started
+    // Subtract elapsed processing time to self-correct for drift
+    const delayMs = Math.max(0, Math.round((targetNs - elapsedSinceTickStartNs) / 1_000_000));
+    this.tickHandle = setTimeout(() => this.tick(), delayMs);
   }
 
   stop() {
     this.running = false;
     if (this.tickHandle) {
-      clearInterval(this.tickHandle);
+      clearTimeout(this.tickHandle);
       this.tickHandle = null;
     }
+    this.lastTickTime = null;
     this.lastBroadcastState = null;
   }
 
   tick() {
     if (!this.running || this.finished || !this.state) return;
+
+    const now = process.hrtime.bigint();
+    // Use actual elapsed time, clamped to avoid spiral-of-death
+    const actualDtMs = this.lastTickTime
+      ? Math.min(Number(now - this.lastTickTime) / 1_000_000, SIM_TICK_MS * 2)
+      : SIM_TICK_MS;
+    this.lastTickTime = now;
 
     this.serverTick += 1;
 
@@ -207,7 +228,7 @@ class RoomRuntime {
       }
     }
 
-    Game.tick(this.state, SIM_TICK_MS);
+    Game.tick(this.state, actualDtMs);
 
     if (this.serverTick % NETWORK_EVERY_SIM_TICKS === 0) {
       this.networkTick += 1;
@@ -242,7 +263,10 @@ class RoomRuntime {
     }
 
     const terminal = Game.isTerminal(this.state);
-    if (!terminal.terminal) return;
+    if (!terminal.terminal) {
+      this._scheduleNextTick();
+      return;
+    }
 
     this.finished = true;
     this.handleMatchEnd(terminal).catch((err) => {
@@ -288,7 +312,7 @@ class RoomRuntime {
     const msg = JSON.stringify({ type, payload });
     for (const { ws } of this.sessions.values()) {
       if (ws.readyState === 1) {
-        try { ws.send(msg); } catch {}
+        try { ws.send(msg); } catch { }
       }
     }
   }
@@ -518,7 +542,7 @@ function handleMessage(ws, session, msg) {
         player_id: session.userId,
       });
     }
-    try { ws.close(); } catch {}
+    try { ws.close(); } catch { }
   }
 }
 
@@ -589,7 +613,7 @@ app.prepare().then(() => {
 
     if (!token) {
       sendJson(ws, { type: 'error', payload: { code: 'NO_TOKEN', message: 'Missing access token' } });
-      try { ws.close(); } catch {}
+      try { ws.close(); } catch { }
       return;
     }
 
@@ -611,7 +635,7 @@ app.prepare().then(() => {
       .catch((err) => {
         console.error('[WS] auth_failed', err?.message || err);
         sendJson(ws, { type: 'error', payload: { code: 'INVALID_TOKEN', message: err?.message || 'Invalid token' } });
-        try { ws.close(); } catch {}
+        try { ws.close(); } catch { }
       });
   });
 

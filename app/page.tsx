@@ -71,14 +71,14 @@ const BRUTAL_CLIENT_SIDE_MODE = process.env.NEXT_PUBLIC_BRUTAL_CLIENT_SIDE_MODE 
 const WORLD_SIZE = 100;
 const PLAYER_RADIUS = 1.5;
 const PROJECTILE_RADIUS = 0.45;
-const INPUT_SEND_MS = 33;
-const INTERP_DELAY_MS = Number(process.env.NEXT_PUBLIC_INTERP_DELAY_MS || (BRUTAL_CLIENT_SIDE_MODE ? 20 : 28));
+const INPUT_SEND_MS = 16;
+const INTERP_DELAY_MS = Number(process.env.NEXT_PUBLIC_INTERP_DELAY_MS || (BRUTAL_CLIENT_SIDE_MODE ? 20 : 10));
 const UI_TICK_UPDATE_EVERY = 2;
 const MAX_PENDING_INPUTS = 120;
 const IMMEDIATE_INPUT_MIN_GAP_MS = 12;
 const UNSENT_PREDICTION_MAX_MS = INPUT_SEND_MS;
 const MAX_RENDER_DELTA_MS = 64;
-const EXPECTED_NET_UPDATE_MS = 50;
+const EXPECTED_NET_UPDATE_MS = 18;
 
 const FIRE_COOLDOWN_MS = 180;
 const PROJECTILE_SPEED = 60;
@@ -88,19 +88,21 @@ const PREDICTED_PROJECTILE_BRIDGE_MS = 450;
 const PROJECTILE_RECONCILE_DIST = 2.6;
 const PROJECTILE_RECONCILE_DIST_LAX = 12;
 
-const POS_ERROR_SOFT = 0.45;
-const POS_ERROR_HARD = 2.2;
-const VEL_ERROR_SOFT = 1.3;
-const ANGLE_ERROR_SOFT = 0.12;
-const ANGLE_ERROR_HARD = 0.85;
-const CORRECTION_SMOOTH_MS = 110;
-const CORRECTION_MIN_INTERVAL_MS = 55;
+// --- CS:GO 2 style: no reconciliation smoothing ---
+// Only snap-correct if truly desynced (teleport / severe packet loss)
+const DESYNC_SNAP_THRESHOLD = 15;
 
 const TURN_RATE = 3.8;
 const ACCEL_FORWARD = 55;
 const ACCEL_REVERSE = 28;
 const LINEAR_DRAG_PER_SECOND = 0.18;
 const MAX_SPEED = 32;
+
+// Match server quantization to avoid rounding-induced reconciliation
+const STATE_PRECISION = 10000;
+function roundState(v: number): number {
+  return Math.round(v * STATE_PRECISION) / STATE_PRECISION;
+}
 
 function isFireKey(event: KeyboardEvent): boolean {
   return event.code === "KeyE" || event.key.toLowerCase() === "e";
@@ -123,7 +125,7 @@ function normalizeAngle(v: number): number {
   const tau = Math.PI * 2;
   let n = v % tau;
   if (n < 0) n += tau;
-  return n;
+  return roundState(n);
 }
 
 function toProjectile(raw: AnyObj): ProjectileState {
@@ -365,6 +367,13 @@ function applyInputToPlayer(base: PlayerState, input: InputPayload, dtSec: numbe
     if (p.vy > 0) p.vy = 0;
   }
 
+  // Quantize to match server precision, preventing float-drift reconciliation
+  p.x = roundState(p.x);
+  p.y = roundState(p.y);
+  p.vx = roundState(p.vx);
+  p.vy = roundState(p.vy);
+  p.angle = roundState(p.angle);
+
   return p;
 }
 
@@ -494,48 +503,20 @@ function suppressLocalAuthoritativeDuplicates(
   return out;
 }
 
-function reconcileLocalPlayerVisual(
-  prevVisual: PlayerState | null,
-  authoritative: PlayerState,
-  dtSec: number,
-  nowMs: number,
-  lastCorrectionAtMs: number,
-): { player: PlayerState; corrected: boolean } {
-  if (!prevVisual) return { player: { ...authoritative }, corrected: true };
-  if (!authoritative.alive) return { player: { ...authoritative }, corrected: true };
-
-  const posError = Math.sqrt(distanceSq(prevVisual.x, prevVisual.y, authoritative.x, authoritative.y));
-  const velError = Math.hypot(prevVisual.vx - authoritative.vx, prevVisual.vy - authoritative.vy);
-  const angleError = Math.abs(shortestAngleDelta(prevVisual.angle, authoritative.angle));
-
-  if (posError < POS_ERROR_SOFT && velError < VEL_ERROR_SOFT && angleError < ANGLE_ERROR_SOFT) {
-    return { player: prevVisual, corrected: false };
+/**
+ * CS:GO 2 style server reconciliation:
+ * Take authoritative server state → replay unacked inputs → that IS the position.
+ * No smoothing, no thresholds. Only snap on catastrophic desync.
+ */
+function serverReconcilePlayer(
+  serverState: PlayerState,
+  pendingInputs: PendingInput[],
+): PlayerState {
+  let predicted = { ...serverState };
+  for (const pending of pendingInputs) {
+    predicted = applyInputToPlayer(predicted, pending.payload, pending.dtSec);
   }
-
-  if (posError >= POS_ERROR_HARD || angleError >= ANGLE_ERROR_HARD) {
-    return { player: { ...authoritative }, corrected: true };
-  }
-
-  if (nowMs - lastCorrectionAtMs < CORRECTION_MIN_INTERVAL_MS) {
-    return { player: prevVisual, corrected: false };
-  }
-
-  const alpha = clamp((dtSec * 1000) / CORRECTION_SMOOTH_MS, 0.08, 0.85);
-  return {
-    corrected: true,
-    player: {
-      ...prevVisual,
-      x: prevVisual.x + (authoritative.x - prevVisual.x) * alpha,
-      y: prevVisual.y + (authoritative.y - prevVisual.y) * alpha,
-      vx: prevVisual.vx + (authoritative.vx - prevVisual.vx) * alpha,
-      vy: prevVisual.vy + (authoritative.vy - prevVisual.vy) * alpha,
-      angle: normalizeAngle(lerpAngle(prevVisual.angle, authoritative.angle, alpha)),
-      hp: authoritative.hp,
-      shield: authoritative.shield,
-      weaponLevel: authoritative.weaponLevel,
-      alive: authoritative.alive,
-    },
-  };
+  return predicted;
 }
 
 export default function Page() {
@@ -580,11 +561,10 @@ export default function Page() {
   const lastInputSentAtRef = useRef(0);
   const lastImmediateInputSentAtRef = useRef(0);
   const lastSentFireRef = useRef(false);
-  const localVisualPlayerRef = useRef<PlayerState | null>(null);
-  const lastLocalCorrectionAtRef = useRef(0);
+  const brutalLocalPlayerRef = useRef<PlayerState | null>(null); // Only for BRUTAL_CLIENT_SIDE_MODE
   const joinedRef = useRef(false);
   const gameStartedRef = useRef(false);
-  const sendImmediateInputRef = useRef<() => void>(() => {});
+  const sendImmediateInputRef = useRef<() => void>(() => { });
   const netStatsRef = useRef({ lastPacketAt: 0, emaGapMs: 0, jitterMs: 0 });
   const fpsWindowRef = useRef({ startedAt: 0, frames: 0 });
   const pingRef = useRef({ sentAt: 0, emaRttMs: 0 });
@@ -641,7 +621,7 @@ export default function Page() {
 
     if (!BRUTAL_CLIENT_SIDE_MODE && fireSeq && joinedRef.current && gameStartedRef.current) {
       const myPid = myIdRef.current;
-      const ship = myPid ? (localVisualPlayerRef.current || worldRef.current?.players?.[myPid]) : null;
+      const ship = myPid ? (worldRef.current?.players?.[myPid]) : null;
       if (myPid && ship?.alive) {
         predictedProjectileSeqRef.current += 1;
         predictedProjectilesRef.current.push(
@@ -864,11 +844,9 @@ export default function Page() {
       localFireCooldownMsRef.current = 0;
       lastRenderAtRef.current = null;
       lastSentFireRef.current = false;
-      localVisualPlayerRef.current = null;
-      lastLocalCorrectionAtRef.current = 0;
       netStatsRef.current = { lastPacketAt: 0, emaGapMs: 0, jitterMs: 0 };
       pingRef.current = { sentAt: 0, emaRttMs: 0 };
-      try { window.Usion?.game?.disconnect?.(); } catch {}
+      try { window.Usion?.game?.disconnect?.(); } catch { }
     };
   }, []);
 
@@ -924,12 +902,12 @@ export default function Page() {
       const newestMe = newest?.players?.[myPid];
       if (BRUTAL_CLIENT_SIDE_MODE) {
         const serverMe = newestMe || renderState.players[myPid] || undefined;
-        const seedMe = localVisualPlayerRef.current || serverMe;
+        const seedMe = brutalLocalPlayerRef.current || serverMe;
         if (seedMe) {
           const nextLocal = (joinedRef.current && gameStartedRef.current)
             ? applyInputToPlayer(seedMe, buildInputFromKeys(keysRef.current), frameDtSec)
             : seedMe;
-          localVisualPlayerRef.current = { ...nextLocal };
+          brutalLocalPlayerRef.current = { ...nextLocal };
           renderState = {
             ...renderState,
             players: {
@@ -939,33 +917,34 @@ export default function Page() {
           };
         }
       } else if (newestMe) {
-        const reconciled = reconcileLocalPlayerVisual(
-          localVisualPlayerRef.current,
-          newestMe,
-          frameDtSec,
-          now,
-          lastLocalCorrectionAtRef.current,
-        );
-        if (reconciled.corrected) {
-          lastLocalCorrectionAtRef.current = now;
+        // ========== CS:GO 2 model: server state + input replay ==========
+        // Start from the latest server-confirmed state for our player,
+        // then replay all unacknowledged pending inputs deterministically.
+        // The result IS our position — no smoothing, no blending.
+        let predictedMe: PlayerState;
+
+        if (!newestMe.alive) {
+          // Dead — just use the server state, no prediction
+          predictedMe = { ...newestMe };
+        } else {
+          predictedMe = serverReconcilePlayer(newestMe, pendingInputsRef.current);
+
+          // Always extrapolate forward with current input for sub-tick smoothness.
+          // Even with zero input, the ship has velocity that must advance each frame
+          // to avoid the "freeze then jump" stutter between server updates.
+          const unsentMs = clamp(now - lastInputSentAtRef.current, 0, UNSENT_PREDICTION_MAX_MS);
+          if (unsentMs > 0) {
+            predictedMe = applyInputToPlayer(predictedMe, buildInputFromKeys(keysRef.current), unsentMs / 1000);
+          }
         }
+
         renderState = {
           ...renderState,
           players: {
             ...renderState.players,
-            [myPid]: { ...reconciled.player },
+            [myPid]: predictedMe,
           },
         };
-      }
-      if (!BRUTAL_CLIENT_SIDE_MODE) {
-        for (const pending of pendingInputsRef.current) {
-          renderState = applyLocalPrediction(renderState, myPid, pending.payload, pending.dtSec);
-        }
-
-        const unsentMs = clamp(now - lastInputSentAtRef.current, 0, UNSENT_PREDICTION_MAX_MS);
-        if (unsentMs > 0) {
-          renderState = applyLocalPrediction(renderState, myPid, buildInputFromKeys(keysRef.current), unsentMs / 1000);
-        }
       }
 
       predictedProjectilesRef.current = reconcilePredictedProjectiles(
@@ -976,13 +955,9 @@ export default function Page() {
       if (BRUTAL_CLIENT_SIDE_MODE && predictedProjectilesRef.current.length > 0) {
         predictedProjectilesRef.current = [];
       }
-      if (renderState.players[myPid]) {
-        localVisualPlayerRef.current = { ...renderState.players[myPid] };
-      }
     } else if (predictedProjectilesRef.current.length > 0) {
       predictedProjectilesRef.current = [];
       localFireCooldownMsRef.current = 0;
-      localVisualPlayerRef.current = null;
     }
 
     if (predictedProjectilesRef.current.length > 0) {
@@ -1046,10 +1021,10 @@ export default function Page() {
     if (!merged) return;
 
     const myPid = myIdRef.current;
-    if (BRUTAL_CLIENT_SIDE_MODE && myPid && localVisualPlayerRef.current) {
+    if (BRUTAL_CLIENT_SIDE_MODE && myPid && brutalLocalPlayerRef.current) {
       merged.players = {
         ...merged.players,
-        [myPid]: blendServerAndLocalPlayer(merged.players[myPid], localVisualPlayerRef.current),
+        [myPid]: blendServerAndLocalPlayer(merged.players[myPid], brutalLocalPlayerRef.current),
       };
     }
     worldRef.current = merged;
@@ -1119,8 +1094,6 @@ export default function Page() {
     localFireCooldownMsRef.current = 0;
     lastRenderAtRef.current = null;
     lastSentFireRef.current = false;
-    localVisualPlayerRef.current = null;
-    lastLocalCorrectionAtRef.current = 0;
 
     const uid = String(usion.user?.getId?.() || "");
     myIdRef.current = uid;
@@ -1153,8 +1126,6 @@ export default function Page() {
           lastInputSentAtRef.current = performance.now() - INPUT_SEND_MS;
           localFireCooldownMsRef.current = 0;
           lastSentFireRef.current = false;
-          localVisualPlayerRef.current = null;
-          lastLocalCorrectionAtRef.current = 0;
           setJoined(true);
           setPlayerCount((data?.player_ids || []).length);
           const waiting = Number(data?.waiting_for || 0);
@@ -1183,8 +1154,6 @@ export default function Page() {
           predictedProjectilesRef.current = [];
           localFireSeqRef.current = 0;
           lastSentFireRef.current = false;
-          localVisualPlayerRef.current = null;
-          lastLocalCorrectionAtRef.current = 0;
           setGameStarted(true);
           appendLog("Game started");
           setStatus("Fight");
@@ -1224,8 +1193,6 @@ export default function Page() {
           localFireSeqRef.current = 0;
           localFireCooldownMsRef.current = 0;
           lastSentFireRef.current = false;
-          localVisualPlayerRef.current = null;
-          lastLocalCorrectionAtRef.current = 0;
           setGameStarted(false);
           appendLog(`Game finished (${data?.reason || "done"})`);
           setStatus(`Match ended (${data?.reason || "done"})`);
@@ -1243,7 +1210,7 @@ export default function Page() {
       for (let attempt = 1; attempt <= JOIN_RETRY_LIMIT; attempt++) {
         try {
           appendLog(`Connect attempt ${attempt}/${JOIN_RETRY_LIMIT}`);
-          try { usion.game.disconnect?.(); } catch {}
+          try { usion.game.disconnect?.(); } catch { }
           await sleep(100);
 
           await usion.game.connectDirect();
@@ -1262,8 +1229,6 @@ export default function Page() {
           localFireCooldownMsRef.current = 0;
           lastInputSentAtRef.current = performance.now() - INPUT_SEND_MS;
           lastSentFireRef.current = false;
-          localVisualPlayerRef.current = null;
-          lastLocalCorrectionAtRef.current = 0;
           setJoined(true);
           setPlayerCount((joinRes?.player_ids || []).length);
           const waiting = Number(joinRes?.waiting_for || 0);
