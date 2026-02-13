@@ -63,6 +63,7 @@ class RoomRuntime {
     this.latestInputByUser = new Map(); // userId -> payload
     this.lastSeqByUser = {}; // monotonic validation
     this.ackSeqByPlayer = {};
+    this.lastBroadcastState = null;
   }
 
   get activePlayers() {
@@ -162,6 +163,7 @@ class RoomRuntime {
       clearInterval(this.tickHandle);
       this.tickHandle = null;
     }
+    this.lastBroadcastState = null;
   }
 
   tick() {
@@ -184,22 +186,20 @@ class RoomRuntime {
     };
 
     if (this.serverTick % SNAPSHOT_EVERY_TICKS === 0) {
+      const snapshotState = cloneState(this.state);
       this.broadcast('state_snapshot', {
         ...payloadBase,
-        full_state: cloneState(this.state),
+        full_state: snapshotState,
       });
+      this.lastBroadcastState = snapshotState;
     } else {
+      const delta = buildDelta(this.lastBroadcastState, this.state);
       this.broadcast('state_delta', {
         ...payloadBase,
-        changed_entities: {
-          phase: this.state.phase,
-          remainingMs: this.state.remainingMs,
-          players: this.state.players,
-          projectiles: this.state.projectiles,
-          pickups: this.state.pickups,
-        },
-        removed_entities: { projectiles: [] },
+        changed_entities: delta.changed_entities,
+        removed_entities: delta.removed_entities,
       });
+      this.lastBroadcastState = cloneState(this.state);
     }
 
     const terminal = Game.isTerminal(this.state);
@@ -282,6 +282,103 @@ function buildFinalStats(state) {
     out[pid] = p.stats || {};
   }
   return out;
+}
+
+function entityMapById(items) {
+  const out = new Map();
+  for (const item of items || []) {
+    if (item && item.id !== undefined && item.id !== null) {
+      out.set(String(item.id), item);
+    }
+  }
+  return out;
+}
+
+function shallowEqualEntity(a, b) {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  const aKeys = Object.keys(a);
+  const bKeys = Object.keys(b);
+  if (aKeys.length !== bKeys.length) return false;
+  for (const key of aKeys) {
+    if (!Object.prototype.hasOwnProperty.call(b, key)) return false;
+    if (a[key] !== b[key]) return false;
+  }
+  return true;
+}
+
+function buildDelta(prevState, nextState) {
+  const changed = {};
+  const removed = { projectiles: [], pickups: [] };
+
+  if (!prevState) {
+    return {
+      changed_entities: {
+        phase: nextState.phase,
+        remainingMs: nextState.remainingMs,
+        players: nextState.players,
+        projectiles: nextState.projectiles,
+        pickups: nextState.pickups,
+      },
+      removed_entities: removed,
+    };
+  }
+
+  if (prevState.phase !== nextState.phase) {
+    changed.phase = nextState.phase;
+  }
+  if (prevState.remainingMs !== nextState.remainingMs) {
+    changed.remainingMs = nextState.remainingMs;
+  }
+
+  const playerPatch = {};
+  const prevPlayers = prevState.players || {};
+  const nextPlayers = nextState.players || {};
+  for (const [pid, p] of Object.entries(nextPlayers)) {
+    if (!prevPlayers[pid] || !shallowEqualEntity(prevPlayers[pid], p)) {
+      playerPatch[pid] = p;
+    }
+  }
+  if (Object.keys(playerPatch).length > 0) {
+    changed.players = playerPatch;
+  }
+
+  const prevProjectiles = entityMapById(prevState.projectiles || []);
+  const nextProjectiles = entityMapById(nextState.projectiles || []);
+  const projectilePatch = [];
+  for (const [id, pr] of nextProjectiles.entries()) {
+    const prev = prevProjectiles.get(id);
+    if (!prev || !shallowEqualEntity(prev, pr)) {
+      projectilePatch.push(pr);
+    }
+  }
+  for (const id of prevProjectiles.keys()) {
+    if (!nextProjectiles.has(id)) removed.projectiles.push(id);
+  }
+  if (projectilePatch.length > 0) {
+    changed.projectiles = projectilePatch;
+  }
+
+  const prevPickups = entityMapById(prevState.pickups || []);
+  const nextPickups = entityMapById(nextState.pickups || []);
+  const pickupPatch = [];
+  for (const [id, pu] of nextPickups.entries()) {
+    const prev = prevPickups.get(id);
+    if (!prev || !shallowEqualEntity(prev, pu)) {
+      pickupPatch.push(pu);
+    }
+  }
+  for (const id of prevPickups.keys()) {
+    if (!nextPickups.has(id)) removed.pickups.push(id);
+  }
+  if (pickupPatch.length > 0) {
+    changed.pickups = pickupPatch;
+  }
+
+  return {
+    changed_entities: changed,
+    removed_entities: removed,
+  };
 }
 
 function hashRoomId(roomId) {

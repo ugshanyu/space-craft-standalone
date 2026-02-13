@@ -101,6 +101,29 @@ function cloneWorld(state: AnyObj): WorldState {
   };
 }
 
+function patchEntitiesById<T extends { id: string }>(
+  base: T[],
+  patch: AnyObj[] | undefined,
+  removed: string[] | undefined,
+): T[] {
+  const byId = new Map<string, T>();
+  for (const item of base || []) byId.set(String(item.id), item);
+
+  if (Array.isArray(patch)) {
+    for (const raw of patch) {
+      if (!raw || raw.id === undefined || raw.id === null) continue;
+      const id = String(raw.id);
+      byId.set(id, raw as T);
+    }
+  }
+
+  if (Array.isArray(removed)) {
+    for (const id of removed) byId.delete(String(id));
+  }
+
+  return Array.from(byId.values());
+}
+
 function mergeDelta(base: WorldState | null, data: AnyObj): WorldState | null {
   if (!base) {
     if (!data?.full_state) return null;
@@ -111,17 +134,39 @@ function mergeDelta(base: WorldState | null, data: AnyObj): WorldState | null {
   if (!data?.changed_entities) return base;
 
   const changed = data.changed_entities;
+  const removed = data.removed_entities || {};
+  const basePlayers = base.players || {};
+  let players = basePlayers;
+  if (changed.players) {
+    const changedPlayers = cloneWorld({ players: changed.players }).players;
+    players = { ...basePlayers, ...changedPlayers };
+  }
+
+  let projectiles = base.projectiles;
+  if (changed.projectiles || removed.projectiles) {
+    projectiles = patchEntitiesById(
+      base.projectiles,
+      changed.projectiles as AnyObj[] | undefined,
+      removed.projectiles as string[] | undefined,
+    );
+  }
+
+  let pickups = base.pickups;
+  if (changed.pickups || removed.pickups) {
+    pickups = patchEntitiesById(
+      base.pickups,
+      changed.pickups as AnyObj[] | undefined,
+      removed.pickups as string[] | undefined,
+    ).map((x: AnyObj) => ({ id: String(x.id || ""), x: Number(x.x || 0), y: Number(x.y || 0), type: String(x.type || "") }));
+  }
+
   const merged: WorldState = {
     ...base,
     phase: changed.phase !== undefined ? String(changed.phase) : base.phase,
     remainingMs: changed.remainingMs !== undefined ? Number(changed.remainingMs) : base.remainingMs,
-    players: changed.players ? cloneWorld({ players: changed.players }).players : base.players,
-    projectiles: changed.projectiles
-      ? (changed.projectiles as AnyObj[]).map((x) => ({ id: String(x.id || ""), x: Number(x.x || 0), y: Number(x.y || 0) }))
-      : base.projectiles,
-    pickups: changed.pickups
-      ? (changed.pickups as AnyObj[]).map((x) => ({ id: String(x.id || ""), x: Number(x.x || 0), y: Number(x.y || 0), type: String(x.type || "") }))
-      : base.pickups,
+    players,
+    projectiles: projectiles.map((x) => ({ id: String(x.id || ""), x: Number(x.x || 0), y: Number(x.y || 0) })),
+    pickups,
   };
 
   return merged;
@@ -356,7 +401,7 @@ export default function Page() {
     const myPid = myIdRef.current;
     if (myPid) {
       const input = buildInputFromKeys(keysRef.current);
-      renderState = applyLocalPrediction(renderState, myPid, input, Math.min(0.12, INTERP_DELAY_MS / 1000));
+      renderState = applyLocalPrediction(renderState, myPid, input, INPUT_SEND_MS / 1000);
     }
 
     drawWorld(renderState, canvas, myPid);
