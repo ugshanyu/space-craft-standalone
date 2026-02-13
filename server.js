@@ -25,7 +25,7 @@ const SIM_TICK_MS = Math.floor(1000 / SIM_TICK_HZ);
 const NETWORK_HZ = Math.max(1, Number(process.env.NETWORK_HZ || 60));
 const NETWORK_EVERY_SIM_TICKS = Math.max(1, Math.floor(SIM_TICK_HZ / NETWORK_HZ));
 const FULL_SNAPSHOT_INTERVAL_NET_TICKS = Math.max(1, Number(process.env.FULL_SNAPSHOT_INTERVAL_NET_TICKS || NETWORK_HZ));
-const MAX_LAG_COMP_MS = 120;
+const MAX_LAG_COMP_MS = 400;
 const MAX_CLIENT_INPUT_AGE_MS = 2000;
 const NET_PROFILE = {
   deploy_region: DEPLOY_REGION,
@@ -163,6 +163,7 @@ class RoomRuntime {
       thrust: Number(payload?.thrust || 0),
       fire: Boolean(payload?.fire),
       fire_pressed: Boolean(payload?.fire_pressed),
+      fire_seq: payload?.fire_seq,
       lag_comp_ms: lagCompMs,
     });
     return { accepted: true };
@@ -333,6 +334,9 @@ function toNetworkState(state) {
       shield: Number(p.shield || 0),
       weaponLevel: Number(p.weaponLevel || 1),
       alive: Boolean(p.alive),
+      specialWeapon: p.specialWeapon || null,
+      specialUses: Number(p.specialUses || 0),
+      laserActiveMs: Number(p.laserActiveMs || 0),
     };
   }
   return {
@@ -349,12 +353,21 @@ function toNetworkState(state) {
       vy: Number(x.vy || 0),
       ttlMs: Number(x.ttlMs || 0),
       fireSeq: Number.isFinite(Number(x.fireSeq)) ? Number(x.fireSeq) : undefined,
+      isBomb: Boolean(x.isBomb),
     })),
     pickups: (state.pickups || []).map((x) => ({
       id: String(x.id || ''),
       x: Number(x.x || 0),
       y: Number(x.y || 0),
       type: String(x.type || ''),
+    })),
+    effects: (state.effects || []).map((x) => ({
+      type: String(x.type || ''),
+      x: Number(x.x || 0),
+      y: Number(x.y || 0),
+      radius: Number(x.radius || 0),
+      ownerId: String(x.ownerId || ''),
+      ttlMs: Number(x.ttlMs || 0),
     })),
   };
 }
@@ -404,6 +417,7 @@ function buildDelta(prevState, nextState) {
         players: nextState.players,
         projectiles: nextState.projectiles,
         pickups: nextState.pickups,
+        effects: nextState.effects,
       },
       removed_entities: removed,
     };
@@ -461,6 +475,12 @@ function buildDelta(prevState, nextState) {
   }
   if (pickupPatch.length > 0) {
     changed.pickups = pickupPatch;
+  }
+
+  // Effects are always sent in full when present (short-lived visual FX)
+  const nextEffects = nextState.effects || [];
+  if (nextEffects.length > 0) {
+    changed.effects = nextEffects;
   }
 
   return {

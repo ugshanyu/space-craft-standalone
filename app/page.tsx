@@ -15,6 +15,9 @@ type PlayerState = {
   shield: number;
   weaponLevel: number;
   alive: boolean;
+  specialWeapon?: string | null;
+  specialUses?: number;
+  laserActiveMs?: number;
 };
 
 type ProjectileState = {
@@ -26,6 +29,16 @@ type ProjectileState = {
   vy: number;
   ttlMs: number;
   fireSeq?: number;
+  isBomb?: boolean;
+};
+
+type EffectState = {
+  type: string;
+  x: number;
+  y: number;
+  radius: number;
+  ownerId: string;
+  ttlMs: number;
 };
 
 type WorldState = {
@@ -35,6 +48,7 @@ type WorldState = {
   players: Record<string, PlayerState>;
   projectiles: ProjectileState[];
   pickups: Array<{ id: string; x: number; y: number; type?: string }>;
+  effects?: EffectState[];
 };
 
 type SnapshotFrame = {
@@ -69,28 +83,35 @@ const JOIN_RETRY_BACKOFF_MS = 600;
 const BRUTAL_CLIENT_SIDE_MODE = process.env.NEXT_PUBLIC_BRUTAL_CLIENT_SIDE_MODE === "1";
 
 const WORLD_SIZE = 100;
-const PLAYER_RADIUS = 1.5;
-const PROJECTILE_RADIUS = 0.45;
-const INPUT_SEND_MS = 16;
+const PLAYER_RADIUS = 2.5;
+const PROJECTILE_RADIUS = 0.8;
+const INPUT_SEND_MS_BASE = 16;
+const INPUT_SEND_MS_HIGH_RTT = 50;
+const HIGH_RTT_THRESHOLD = 100;
 const INTERP_DELAY_MS = Number(process.env.NEXT_PUBLIC_INTERP_DELAY_MS || (BRUTAL_CLIENT_SIDE_MODE ? 20 : 10));
 const UI_TICK_UPDATE_EVERY = 2;
 const MAX_PENDING_INPUTS = 120;
 const IMMEDIATE_INPUT_MIN_GAP_MS = 12;
-const UNSENT_PREDICTION_MAX_MS = INPUT_SEND_MS;
 const MAX_RENDER_DELTA_MS = 64;
 const EXPECTED_NET_UPDATE_MS = 18;
 
-const FIRE_COOLDOWN_MS = 180;
-const PROJECTILE_SPEED = 60;
-const PROJECTILE_TTL_MS = 1100;
-const PROJECTILE_MUZZLE_OFFSET = 2;
-const PREDICTED_PROJECTILE_BRIDGE_MS = 450;
-const PROJECTILE_RECONCILE_DIST = 2.6;
-const PROJECTILE_RECONCILE_DIST_LAX = 12;
+const FIRE_COOLDOWN_MS = 160;
+const PROJECTILE_SPEED = 70;
+const PROJECTILE_TTL_MS = 1200;
+const PROJECTILE_MUZZLE_OFFSET = 3;
+const PREDICTED_PROJECTILE_BRIDGE_MS = 1200;
+const PROJECTILE_RECONCILE_DIST = 3.5;
+const PROJECTILE_RECONCILE_DIST_LAX = 14;
 
 // --- CS:GO 2 style: no reconciliation smoothing ---
 // Only snap-correct if truly desynced (teleport / severe packet loss)
 const DESYNC_SNAP_THRESHOLD = 15;
+
+// Adaptive input rate based on RTT
+function getInputSendMs(rttMs: number): number {
+  if (!rttMs || rttMs <= HIGH_RTT_THRESHOLD) return INPUT_SEND_MS_BASE;
+  return INPUT_SEND_MS_HIGH_RTT;
+}
 
 const TURN_RATE = 3.8;
 const ACCEL_FORWARD = 55;
@@ -139,6 +160,7 @@ function toProjectile(raw: AnyObj): ProjectileState {
     vy: Number(raw?.vy || 0),
     ttlMs: Number(raw?.ttlMs || 0),
     fireSeq: Number.isFinite(fireSeq) && fireSeq > 0 ? Math.floor(fireSeq) : undefined,
+    isBomb: Boolean(raw?.isBomb),
   };
 }
 
@@ -157,6 +179,9 @@ function cloneWorld(state: AnyObj): WorldState {
       shield: Number(pp.shield || 0),
       weaponLevel: Number(pp.weaponLevel || 1),
       alive: Boolean(pp.alive),
+      specialWeapon: pp.specialWeapon ? String(pp.specialWeapon) : null,
+      specialUses: Number(pp.specialUses || 0),
+      laserActiveMs: Number(pp.laserActiveMs || 0),
     };
   }
 
@@ -167,6 +192,7 @@ function cloneWorld(state: AnyObj): WorldState {
     players,
     projectiles: (state?.projectiles || []).map((x: AnyObj) => toProjectile(x)),
     pickups: (state?.pickups || []).map((x: AnyObj) => ({ id: String(x.id || ""), x: Number(x.x || 0), y: Number(x.y || 0), type: String(x.type || "") })),
+    effects: (state?.effects || []).map((x: AnyObj) => ({ type: String(x.type || ""), x: Number(x.x || 0), y: Number(x.y || 0), radius: Number(x.radius || 0), ownerId: String(x.ownerId || ""), ttlMs: Number(x.ttlMs || 0) })),
   };
 }
 
@@ -229,6 +255,19 @@ function mergeDelta(base: WorldState | null, data: AnyObj): WorldState | null {
     ).map((x: AnyObj) => ({ id: String(x.id || ""), x: Number(x.x || 0), y: Number(x.y || 0), type: String(x.type || "") }));
   }
 
+  // Effects are always replaced wholesale (they have TTL-based lifecycle)
+  let effects = base.effects || [];
+  if (changed.effects) {
+    effects = (changed.effects as AnyObj[]).map((x: AnyObj) => ({
+      type: String(x.type || ""),
+      x: Number(x.x || 0),
+      y: Number(x.y || 0),
+      radius: Number(x.radius || 0),
+      ownerId: String(x.ownerId || ""),
+      ttlMs: Number(x.ttlMs || 0),
+    }));
+  }
+
   const merged: WorldState = {
     ...base,
     phase: changed.phase !== undefined ? String(changed.phase) : base.phase,
@@ -237,6 +276,7 @@ function mergeDelta(base: WorldState | null, data: AnyObj): WorldState | null {
     players,
     projectiles: projectiles.map((x: AnyObj) => toProjectile(x)),
     pickups,
+    effects,
   };
 
   return merged;
@@ -313,6 +353,9 @@ function interpolateWorld(a: WorldState, b: WorldState, t: number): WorldState {
       shield: pa.shield + (pb.shield - pa.shield) * t,
       weaponLevel: t < 0.5 ? pa.weaponLevel : pb.weaponLevel,
       alive: t < 0.5 ? pa.alive : pb.alive,
+      specialWeapon: pb.specialWeapon,
+      specialUses: pb.specialUses,
+      laserActiveMs: pb.laserActiveMs,
     };
   }
 
@@ -323,6 +366,7 @@ function interpolateWorld(a: WorldState, b: WorldState, t: number): WorldState {
     players: outPlayers,
     projectiles: interpolateProjectiles(a.projectiles, b.projectiles, t),
     pickups: b.pickups,
+    effects: b.effects,
   };
 }
 
@@ -607,7 +651,8 @@ export default function Page() {
     };
     usion.game.realtime("control", inputWithTiming);
 
-    const prevSentAt = lastInputSentAtRef.current || sentAtMs - INPUT_SEND_MS;
+    const effectiveInputMs = getInputSendMs(pingRef.current.emaRttMs);
+    const prevSentAt = lastInputSentAtRef.current || sentAtMs - effectiveInputMs;
     const dtSec = clamp((sentAtMs - prevSentAt) / 1000, 1 / 240, 0.12);
     lastInputSentAtRef.current = sentAtMs;
 
@@ -621,7 +666,13 @@ export default function Page() {
 
     if (!BRUTAL_CLIENT_SIDE_MODE && fireSeq && joinedRef.current && gameStartedRef.current) {
       const myPid = myIdRef.current;
-      const ship = myPid ? (worldRef.current?.players?.[myPid]) : null;
+      // Spawn predicted projectile from the CLIENT-PREDICTED position (what the player sees)
+      // not the stale server state (which lags by RTT/2)
+      const serverMe = worldRef.current?.players?.[myPid];
+      const predictedShip = serverMe
+        ? serverReconcilePlayer(serverMe, pendingInputsRef.current)
+        : null;
+      const ship = predictedShip || serverMe;
       if (myPid && ship?.alive) {
         predictedProjectileSeqRef.current += 1;
         predictedProjectilesRef.current.push(
@@ -817,16 +868,20 @@ export default function Page() {
     if (!usion?.game) return;
 
     if (gameStarted && joined && !inputTimerRef.current) {
-      lastInputSentAtRef.current = performance.now() - INPUT_SEND_MS;
+      lastInputSentAtRef.current = performance.now() - INPUT_SEND_MS_BASE;
       lastSentFireRef.current = false;
-      inputTimerRef.current = window.setInterval(() => {
+      // Use setTimeout loop for adaptive rate based on RTT
+      const scheduleInput = () => {
         const input = buildInputFromKeys(keysRef.current);
         sendControlInput(usion, input);
-      }, INPUT_SEND_MS);
+        const ms = getInputSendMs(pingRef.current.emaRttMs);
+        inputTimerRef.current = window.setTimeout(scheduleInput, ms);
+      };
+      inputTimerRef.current = window.setTimeout(scheduleInput, getInputSendMs(pingRef.current.emaRttMs));
     }
 
     if ((!gameStarted || !joined) && inputTimerRef.current) {
-      window.clearInterval(inputTimerRef.current);
+      window.clearTimeout(inputTimerRef.current);
       inputTimerRef.current = null;
     }
   }, [gameStarted, joined]);
@@ -856,7 +911,7 @@ export default function Page() {
 
     const now = performance.now();
     fpsWindowRef.current.frames += 1;
-    const prevRenderAt = lastRenderAtRef.current ?? now - INPUT_SEND_MS;
+    const prevRenderAt = lastRenderAtRef.current ?? now - INPUT_SEND_MS_BASE;
     const frameDtMs = clamp(now - prevRenderAt, 0, MAX_RENDER_DELTA_MS);
     const frameDtSec = frameDtMs / 1000;
     lastRenderAtRef.current = now;
@@ -932,7 +987,8 @@ export default function Page() {
           // Always extrapolate forward with current input for sub-tick smoothness.
           // Even with zero input, the ship has velocity that must advance each frame
           // to avoid the "freeze then jump" stutter between server updates.
-          const unsentMs = clamp(now - lastInputSentAtRef.current, 0, UNSENT_PREDICTION_MAX_MS);
+          const unsentMaxMs = getInputSendMs(pingRef.current.emaRttMs);
+          const unsentMs = clamp(now - lastInputSentAtRef.current, 0, unsentMaxMs);
           if (unsentMs > 0) {
             predictedMe = applyInputToPlayer(predictedMe, buildInputFromKeys(keysRef.current), unsentMs / 1000);
           }
@@ -1123,7 +1179,7 @@ export default function Page() {
           localFireSeqRef.current = 0;
           lastAckSeqRef.current = 0;
           lastNetworkTickRef.current = 0;
-          lastInputSentAtRef.current = performance.now() - INPUT_SEND_MS;
+          lastInputSentAtRef.current = performance.now() - INPUT_SEND_MS_BASE;
           localFireCooldownMsRef.current = 0;
           lastSentFireRef.current = false;
           setJoined(true);
@@ -1149,7 +1205,7 @@ export default function Page() {
               netHz: Number.isFinite(Number(data.net_hz)) ? Number(data.net_hz) : null,
             });
           }
-          lastInputSentAtRef.current = performance.now() - INPUT_SEND_MS;
+          lastInputSentAtRef.current = performance.now() - INPUT_SEND_MS_BASE;
           localFireCooldownMsRef.current = 0;
           predictedProjectilesRef.current = [];
           localFireSeqRef.current = 0;
@@ -1227,7 +1283,7 @@ export default function Page() {
           predictedProjectileSeqRef.current = 0;
           localFireSeqRef.current = 0;
           localFireCooldownMsRef.current = 0;
-          lastInputSentAtRef.current = performance.now() - INPUT_SEND_MS;
+          lastInputSentAtRef.current = performance.now() - INPUT_SEND_MS_BASE;
           lastSentFireRef.current = false;
           setJoined(true);
           setPlayerCount((joinRes?.player_ids || []).length);
@@ -1396,20 +1452,23 @@ function drawWorld(world: WorldState, canvas: HTMLCanvasElement, myId: string) {
   const h = canvas.height;
   const sx = w / WORLD_SIZE;
   const sy = h / WORLD_SIZE;
-  const shipNose = 16;
-  const shipTail = 12;
-  const shipWing = 10;
-  const hpBarW = 38;
-  const hpBarY = 22;
-  const shieldBarY = 16;
-  const labelY = 29;
 
+  // Ship sizes (bigger)
+  const shipNose = 22;
+  const shipTail = 16;
+  const shipWing = 14;
+  const hpBarW = 48;
+  const hpBarY = 30;
+  const labelY = 38;
+
+  // --- Background ---
   const bg = ctx.createLinearGradient(0, 0, 0, h);
   bg.addColorStop(0, "#07132b");
   bg.addColorStop(1, "#020817");
   ctx.fillStyle = bg;
   ctx.fillRect(0, 0, w, h);
 
+  // --- Grid ---
   ctx.strokeStyle = "rgba(56,189,248,0.06)";
   ctx.lineWidth = 1;
   for (let i = 10; i < WORLD_SIZE; i += 10) {
@@ -1417,76 +1476,251 @@ function drawWorld(world: WorldState, canvas: HTMLCanvasElement, myId: string) {
     ctx.moveTo(i * sx, 0);
     ctx.lineTo(i * sx, h);
     ctx.stroke();
-
     ctx.beginPath();
     ctx.moveTo(0, i * sy);
     ctx.lineTo(w, i * sy);
     ctx.stroke();
   }
 
+  // --- Visual effects (explosions, nova blasts) ---
+  for (const fx of (world.effects || [])) {
+    const fxX = fx.x * sx;
+    const fxY = fx.y * sy;
+    const maxTtl = fx.type === 'nova' ? 400 : 500;
+    const progress = 1 - clamp(fx.ttlMs / maxTtl, 0, 1);
+    const radius = fx.radius * sx * progress;
+    const alpha = clamp(1 - progress, 0.1, 0.8);
+
+    ctx.save();
+    if (fx.type === 'nova') {
+      // Purple nova ring
+      ctx.strokeStyle = `rgba(168,85,247,${alpha})`;
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.arc(fxX, fxY, radius, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.fillStyle = `rgba(168,85,247,${alpha * 0.15})`;
+      ctx.fill();
+    } else {
+      // Orange explosion
+      ctx.strokeStyle = `rgba(251,146,60,${alpha})`;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(fxX, fxY, radius, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.fillStyle = `rgba(251,146,60,${alpha * 0.2})`;
+      ctx.fill();
+      // Inner bright core
+      ctx.fillStyle = `rgba(254,215,170,${alpha * 0.4})`;
+      ctx.beginPath();
+      ctx.arc(fxX, fxY, radius * 0.3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // --- Pickups (3 types with distinct icons) ---
+  const pickupColors: Record<string, { fill: string; glow: string; label: string }> = {
+    laser: { fill: "#ef4444", glow: "#fca5a5", label: "⚡LASER" },
+    bomb: { fill: "#fb923c", glow: "#fed7aa", label: "💣BOMB" },
+    nova: { fill: "#a855f7", glow: "#d8b4fe", label: "✦NOVA" },
+  };
+
   for (const pickup of world.pickups) {
     const x = pickup.x * sx;
     const y = pickup.y * sy;
+    const pType = pickup.type || 'laser';
+    const colors = pickupColors[pType] || pickupColors.laser;
 
+    // Glow
     ctx.save();
+    ctx.shadowColor = colors.glow;
+    ctx.shadowBlur = 14;
+
     ctx.translate(x, y);
-    ctx.rotate((world.tick * 0.06) % (Math.PI * 2));
-    ctx.fillStyle = "#facc15";
+    ctx.rotate((world.tick * 0.04) % (Math.PI * 2));
+    ctx.fillStyle = colors.fill;
     ctx.beginPath();
-    ctx.moveTo(0, -8);
-    ctx.lineTo(8, 0);
-    ctx.lineTo(0, 8);
-    ctx.lineTo(-8, 0);
+    ctx.moveTo(0, -12);
+    ctx.lineTo(12, 0);
+    ctx.lineTo(0, 12);
+    ctx.lineTo(-12, 0);
     ctx.closePath();
     ctx.fill();
+
+    // Inner diamond
+    ctx.fillStyle = colors.glow;
+    ctx.beginPath();
+    ctx.moveTo(0, -5);
+    ctx.lineTo(5, 0);
+    ctx.lineTo(0, 5);
+    ctx.lineTo(-5, 0);
+    ctx.closePath();
+    ctx.fill();
+
     ctx.restore();
 
-    ctx.fillStyle = "#fde68a";
-    ctx.font = "bold 11px system-ui";
-    ctx.fillText("W+", x - 9, y - 11);
+    ctx.fillStyle = colors.glow;
+    ctx.font = "bold 10px system-ui";
+    ctx.textAlign = "center";
+    ctx.fillText(colors.label, x, y - 16);
+    ctx.textAlign = "start";
   }
 
-  ctx.fillStyle = "#fb7185";
-  for (const pr of world.projectiles) {
+  // --- Laser beams (draw before ships so beam appears under) ---
+  for (const [pid, p] of Object.entries(world.players)) {
+    if (!p.alive || p.specialWeapon !== 'laser' || !(p.laserActiveMs && p.laserActiveMs > 0)) continue;
+
+    const lx = p.x * sx;
+    const ly = p.y * sy;
+    const beamRange = 55 * sx;
+    const endX = lx + Math.cos(p.angle) * beamRange;
+    const endY = ly + Math.sin(p.angle) * beamRange;
+    const pulse = 0.6 + Math.sin(world.tick * 0.5) * 0.4;
+
+    // Outer glow
+    ctx.save();
+    ctx.strokeStyle = `rgba(34,211,238,${0.15 * pulse})`;
+    ctx.lineWidth = 12;
     ctx.beginPath();
-    ctx.arc(pr.x * sx, pr.y * sy, 3.4, 0, Math.PI * 2);
-    ctx.fill();
+    ctx.moveTo(lx, ly);
+    ctx.lineTo(endX, endY);
+    ctx.stroke();
+
+    // Inner beam
+    ctx.strokeStyle = pid === myId ? `rgba(34,211,238,${0.8 * pulse})` : `rgba(245,158,11,${0.8 * pulse})`;
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(lx, ly);
+    ctx.lineTo(endX, endY);
+    ctx.stroke();
+
+    // Core
+    ctx.strokeStyle = `rgba(255,255,255,${0.9 * pulse})`;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(lx, ly);
+    ctx.lineTo(endX, endY);
+    ctx.stroke();
+    ctx.restore();
   }
 
+  // --- Projectiles (bigger with glow) ---
+  for (const pr of world.projectiles) {
+    const px = pr.x * sx;
+    const py = pr.y * sy;
+
+    if (pr.isBomb) {
+      // Bomb - glowing orange orb
+      ctx.save();
+      ctx.shadowColor = "#fb923c";
+      ctx.shadowBlur = 12;
+      ctx.fillStyle = "#fb923c";
+      ctx.beginPath();
+      ctx.arc(px, py, 7, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "#fef3c7";
+      ctx.beginPath();
+      ctx.arc(px, py, 3, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    } else {
+      // Normal projectile - big bright bullet
+      ctx.save();
+      ctx.shadowColor = "#fb7185";
+      ctx.shadowBlur = 8;
+      ctx.fillStyle = "#fb7185";
+      ctx.beginPath();
+      ctx.arc(px, py, 6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "#fecdd3";
+      ctx.beginPath();
+      ctx.arc(px, py, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  // --- Ships ---
   for (const [pid, p] of Object.entries(world.players)) {
     const x = p.x * sx;
     const y = p.y * sy;
+    const isMe = pid === myId;
+    const shipColor = p.alive ? (isMe ? "#22d3ee" : "#f59e0b") : "#64748b";
+    const glowColor = p.alive ? (isMe ? "rgba(34,211,238,0.3)" : "rgba(245,158,11,0.3)") : "rgba(100,116,139,0.2)";
+
+    // Engine glow
+    if (p.alive) {
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(p.angle);
+      const engineGrad = ctx.createRadialGradient(-shipTail, 0, 0, -shipTail, 0, 18);
+      engineGrad.addColorStop(0, isMe ? "rgba(34,211,238,0.5)" : "rgba(245,158,11,0.5)");
+      engineGrad.addColorStop(1, "transparent");
+      ctx.fillStyle = engineGrad;
+      ctx.beginPath();
+      ctx.arc(-shipTail, 0, 18, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
 
     ctx.save();
     ctx.translate(x, y);
     ctx.rotate(p.angle);
 
-    ctx.fillStyle = p.alive ? (pid === myId ? "#22d3ee" : "#f59e0b") : "#64748b";
+    // Ship outline glow
+    ctx.shadowColor = glowColor;
+    ctx.shadowBlur = 10;
+
+    // Ship body
+    ctx.fillStyle = shipColor;
     ctx.beginPath();
     ctx.moveTo(shipNose, 0);
     ctx.lineTo(-shipTail, shipWing);
-    ctx.lineTo(-shipTail * 0.66, 0);
+    ctx.lineTo(-shipTail * 0.6, 0);
     ctx.lineTo(-shipTail, -shipWing);
     ctx.closePath();
     ctx.fill();
 
+    // Ship outline
+    ctx.strokeStyle = p.alive ? (isMe ? "#67e8f9" : "#fbbf24") : "#94a3b8";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
     ctx.restore();
 
+    // --- HP bar (no shield bar) ---
     const hp = clamp(p.hp / 100, 0, 1);
-    const sh = clamp(p.shield / 60, 0, 1);
+    const hpColor = hp > 0.5 ? "#22c55e" : hp > 0.25 ? "#eab308" : "#ef4444";
 
-    ctx.fillStyle = "rgba(15,23,42,0.8)";
-    ctx.fillRect(x - hpBarW / 2, y - hpBarY, hpBarW, 4);
-    ctx.fillStyle = "#22c55e";
-    ctx.fillRect(x - hpBarW / 2, y - hpBarY, hpBarW * hp, 4);
+    ctx.fillStyle = "rgba(15,23,42,0.85)";
+    ctx.fillRect(x - hpBarW / 2, y - hpBarY, hpBarW, 5);
+    ctx.fillStyle = hpColor;
+    ctx.fillRect(x - hpBarW / 2, y - hpBarY, hpBarW * hp, 5);
+    // HP bar border
+    ctx.strokeStyle = "rgba(148,163,184,0.3)";
+    ctx.lineWidth = 0.5;
+    ctx.strokeRect(x - hpBarW / 2, y - hpBarY, hpBarW, 5);
 
-    ctx.fillStyle = "rgba(15,23,42,0.8)";
-    ctx.fillRect(x - hpBarW / 2, y - shieldBarY, hpBarW, 3);
-    ctx.fillStyle = "#60a5fa";
-    ctx.fillRect(x - hpBarW / 2, y - shieldBarY, hpBarW * sh, 3);
-
+    // --- Label ---
     ctx.fillStyle = "#e2e8f0";
     ctx.font = "bold 12px system-ui";
-    ctx.fillText(`${pid === myId ? "YOU" : "RIVAL"} W${Math.round(p.weaponLevel)}`, x - 24, y - labelY);
+    ctx.textAlign = "center";
+    const label = isMe ? "YOU" : "RIVAL";
+    ctx.fillText(label, x, y - labelY);
+
+    // --- Special weapon indicator ---
+    if (p.specialWeapon && (p.specialUses ?? 0) > 0) {
+      const weaponNames: Record<string, { name: string; color: string }> = {
+        laser: { name: "⚡LASER", color: "#ef4444" },
+        bomb: { name: "💣BOMB", color: "#fb923c" },
+        nova: { name: "✦NOVA", color: "#a855f7" },
+      };
+      const wInfo = weaponNames[p.specialWeapon] || weaponNames.laser;
+      ctx.fillStyle = wInfo.color;
+      ctx.font = "bold 10px system-ui";
+      ctx.fillText(`${wInfo.name} ×${p.specialUses}`, x, y + hpBarY + 6);
+    }
+    ctx.textAlign = "start";
   }
 }

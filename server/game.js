@@ -1,6 +1,10 @@
 /**
  * Space Craft - Authoritative 2P shooter simulation.
  * Deterministic, fixed-step physics.
+ *
+ * Features:
+ * - Big ships, big projectiles, no shield regen
+ * - 3 power-up types: Laser, Bomb, Nova
  */
 
 const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
@@ -18,25 +22,48 @@ export const CONFIG = {
   linearDragPerSecond: 0.18,
   maxSpeed: 32,
 
-  projectileSpeed: 60,
-  projectileTtlMs: 1100,
-  projectileDamage: 20,
-  fireCooldownMs: 180,
-  maxLagCompensationMs: 120,
+  // --- Projectiles (bigger, faster, harder) ---
+  projectileSpeed: 70,
+  projectileTtlMs: 1200,
+  projectileDamage: 30,
+  fireCooldownMs: 160,
+  maxLagCompensationMs: 400,
 
+  // --- Health (no shield, no regen) ---
   maxHp: 100,
-  maxShield: 60,
-  shieldRegenPerSecond: 8,
 
-  pickupSpawnEveryTicks: 90,
-  maxPickups: 2,
+  // --- Pickups: 3 types ---
+  pickupSpawnEveryTicks: 120,
+  maxPickups: 3,
 
-  playerRadius: 1.5,
-  projectileRadius: 0.45,
-  pickupRadius: 2.2,
+  // --- Sizes (bigger ships & bullets) ---
+  playerRadius: 2.5,
+  projectileRadius: 0.8,
+  pickupRadius: 2.8,
+
+  // --- Special weapons ---
+  laserDps: 80,
+  laserRangeUnits: 55,
+  laserWidthUnits: 1.2,
+  laserDurationMs: 2000,
+  laserCooldownMs: 300,
+
+  bombSpeed: 50,
+  bombDamage: 60,
+  bombRadius: 8,
+  bombTtlMs: 1600,
+
+  novaDamage: 50,
+  novaRadius: 15,
+  novaDurationMs: 400,
+
+  specialUsesPerPickup: 3,
 
   roundDurationMs: 180000,
 };
+
+// Pickup types
+const PICKUP_TYPES = ['laser', 'bomb', 'nova'];
 
 export function initState(playerIds, seed) {
   const spawns = [
@@ -56,10 +83,15 @@ export function initState(playerIds, seed) {
       vy: 0,
       angle: s.angle,
       hp: CONFIG.maxHp,
-      shield: CONFIG.maxShield,
+      shield: 0,
       weaponLevel: 1,
       fireCooldownMs: 0,
       alive: true,
+      // Special weapon state
+      specialWeapon: null, // 'laser' | 'bomb' | 'nova' | null
+      specialUses: 0,
+      laserActiveMs: 0,     // remaining laser beam time
+      novaCooldownMs: 0,
       input: { turn: 0, thrust: 0, fire: false, firePressed: false, fireSeq: null, lagCompMs: 0 },
       stats: {
         kills: 0,
@@ -82,6 +114,8 @@ export function initState(playerIds, seed) {
     players,
     projectiles: [],
     pickups: [],
+    // Visual effects for client rendering
+    effects: [],
     winnerIds: [],
     reason: null,
   };
@@ -107,6 +141,11 @@ export function tick(state, dtMs) {
   const dt = dtMs / 1000;
   state.tick += 1;
   state.remainingMs = Math.max(0, state.remainingMs - dtMs);
+
+  // Expire effects
+  state.effects = (state.effects || [])
+    .map(e => ({ ...e, ttlMs: e.ttlMs - dtMs }))
+    .filter(e => e.ttlMs > 0);
 
   for (const [pid, p] of Object.entries(state.players)) {
     if (!p.alive) continue;
@@ -138,16 +177,40 @@ export function tick(state, dtMs) {
     clampPlayerToArena(p, state);
     quantizePlayerState(p);
 
+    // No shield regeneration at all
     p.fireCooldownMs = Math.max(0, p.fireCooldownMs - dtMs);
-    p.shield = Math.min(CONFIG.maxShield, p.shield + CONFIG.shieldRegenPerSecond * dt);
+    p.novaCooldownMs = Math.max(0, (p.novaCooldownMs || 0) - dtMs);
 
+    // --- Handle firing ---
     if (p.input.firePressed && p.fireCooldownMs <= 0) {
-      const lagCompMs = p.input.firePressed ? p.input.lagCompMs : 0;
-      spawnProjectile(state, pid, p, lagCompMs, p.input.fireSeq);
-      p.fireCooldownMs = CONFIG.fireCooldownMs;
+      if (p.specialWeapon && p.specialUses > 0) {
+        fireSpecialWeapon(state, pid, p);
+      } else {
+        // Normal projectile
+        const lagCompMs = p.input.firePressed ? p.input.lagCompMs : 0;
+        spawnProjectile(state, pid, p, lagCompMs, p.input.fireSeq);
+        p.fireCooldownMs = CONFIG.fireCooldownMs;
+      }
     }
     p.input.firePressed = false;
     p.input.fireSeq = null;
+
+    // --- Laser beam (continuous while fire held + has uses) ---
+    if (p.specialWeapon === 'laser' && p.input.fire && p.specialUses > 0) {
+      p.laserActiveMs = (p.laserActiveMs || 0) + dtMs;
+      applyLaserDamage(state, pid, p, dt);
+      // Consume uses over time
+      if (p.laserActiveMs >= CONFIG.laserDurationMs) {
+        p.specialUses -= 1;
+        p.laserActiveMs = 0;
+        if (p.specialUses <= 0) {
+          p.specialWeapon = null;
+          p.specialUses = 0;
+        }
+      }
+    } else {
+      p.laserActiveMs = 0;
+    }
   }
 
   updateProjectiles(state, dtMs);
@@ -155,6 +218,109 @@ export function tick(state, dtMs) {
   collectPickups(state);
   resolveTerminal(state);
   return state;
+}
+
+function fireSpecialWeapon(state, pid, p) {
+  switch (p.specialWeapon) {
+    case 'bomb': {
+      // Launch a bomb projectile (slower, bigger, explodes on impact or timeout)
+      const muzzle = CONFIG.playerRadius + 1;
+      const pr = {
+        id: `bomb:${state.tick}:${pid}`,
+        ownerId: pid,
+        x: clamp(p.x + Math.cos(p.angle) * muzzle, CONFIG.projectileRadius, state.arena.width - CONFIG.projectileRadius),
+        y: clamp(p.y + Math.sin(p.angle) * muzzle, CONFIG.projectileRadius, state.arena.height - CONFIG.projectileRadius),
+        vx: Math.cos(p.angle) * CONFIG.bombSpeed,
+        vy: Math.sin(p.angle) * CONFIG.bombSpeed,
+        ttlMs: CONFIG.bombTtlMs,
+        fireSeq: p.input.fireSeq || undefined,
+        damage: CONFIG.bombDamage,
+        isBomb: true,
+      };
+      quantizeProjectileState(pr);
+      state.projectiles.push(pr);
+      p.specialUses -= 1;
+      p.fireCooldownMs = CONFIG.fireCooldownMs * 2;
+      if (p.specialUses <= 0) {
+        p.specialWeapon = null;
+        p.specialUses = 0;
+      }
+      break;
+    }
+    case 'nova': {
+      // Instant radius explosion around the player
+      if (p.novaCooldownMs <= 0) {
+        for (const [tid, target] of Object.entries(state.players)) {
+          if (tid === pid || !target.alive) continue;
+          const d = Math.hypot(target.x - p.x, target.y - p.y);
+          if (d <= CONFIG.novaRadius) {
+            const falloff = 1 - (d / CONFIG.novaRadius) * 0.5; // 100% at center, 50% at edge
+            const dmg = Math.round(CONFIG.novaDamage * falloff);
+            target.hp = Math.max(0, target.hp - dmg);
+            p.stats.damageDealt += dmg;
+            if (target.hp <= 0 && target.alive) {
+              target.alive = false;
+              target.stats.deaths += 1;
+              p.stats.kills += 1;
+            }
+          }
+        }
+        // Visual effect
+        state.effects.push({
+          type: 'nova',
+          x: p.x,
+          y: p.y,
+          radius: CONFIG.novaRadius,
+          ownerId: pid,
+          ttlMs: CONFIG.novaDurationMs,
+        });
+        p.specialUses -= 1;
+        p.novaCooldownMs = CONFIG.fireCooldownMs * 3;
+        if (p.specialUses <= 0) {
+          p.specialWeapon = null;
+          p.specialUses = 0;
+        }
+      }
+      break;
+    }
+    case 'laser': {
+      // Laser is handled continuously in the tick loop, not on firePressed
+      // But pressing fire with laser should not consume the normal fire cooldown
+      break;
+    }
+  }
+}
+
+function applyLaserDamage(state, pid, p, dt) {
+  // Raycast beam from player position in facing direction
+  const beamDps = CONFIG.laserDps;
+  const beamRange = CONFIG.laserRangeUnits;
+  const beamHalfWidth = CONFIG.laserWidthUnits / 2;
+
+  for (const [tid, target] of Object.entries(state.players)) {
+    if (tid === pid || !target.alive) continue;
+
+    // Point-to-line-segment distance
+    const dx = target.x - p.x;
+    const dy = target.y - p.y;
+    const beamDirX = Math.cos(p.angle);
+    const beamDirY = Math.sin(p.angle);
+    const proj = dx * beamDirX + dy * beamDirY;
+    if (proj < 0 || proj > beamRange) continue;
+    const perpDist = Math.abs(dx * (-beamDirY) + dy * beamDirX);
+    if (perpDist > beamHalfWidth + CONFIG.playerRadius) continue;
+
+    // Hit! Apply DPS
+    const dmg = beamDps * dt;
+    target.hp = Math.max(0, target.hp - dmg);
+    p.stats.damageDealt += dmg;
+
+    if (target.hp <= 0 && target.alive) {
+      target.alive = false;
+      target.stats.deaths += 1;
+      p.stats.kills += 1;
+    }
+  }
 }
 
 export function isTerminal(state) {
@@ -169,7 +335,7 @@ export function isTerminal(state) {
 }
 
 function spawnProjectile(state, ownerId, p, lagCompMs = 0, fireSeq = null) {
-  const muzzle = 2.0;
+  const muzzle = CONFIG.playerRadius + 0.5;
   const minX = CONFIG.projectileRadius;
   const maxX = state.arena.width - CONFIG.projectileRadius;
   const minY = CONFIG.projectileRadius;
@@ -183,7 +349,8 @@ function spawnProjectile(state, ownerId, p, lagCompMs = 0, fireSeq = null) {
     vy: Math.sin(p.angle) * CONFIG.projectileSpeed,
     ttlMs: CONFIG.projectileTtlMs,
     fireSeq: Number.isFinite(Number(fireSeq)) && Number(fireSeq) > 0 ? Math.floor(Number(fireSeq)) : undefined,
-    damage: CONFIG.projectileDamage + (p.weaponLevel - 1) * 3,
+    damage: CONFIG.projectileDamage,
+    isBomb: false,
   };
 
   const appliedLagMs = clamp(Number(lagCompMs || 0), 0, CONFIG.maxLagCompensationMs);
@@ -206,11 +373,18 @@ function updateProjectiles(state, dtMs) {
 
   for (const pr of state.projectiles) {
     pr.ttlMs -= dtMs;
-    if (pr.ttlMs <= 0) continue;
+    if (pr.ttlMs <= 0) {
+      // Bombs explode on timeout
+      if (pr.isBomb) triggerBombExplosion(state, pr);
+      continue;
+    }
 
     pr.x += pr.vx * dt;
     pr.y += pr.vy * dt;
-    if (isOutOfArena(pr.x, pr.y, state, CONFIG.projectileRadius)) continue;
+    if (isOutOfArena(pr.x, pr.y, state, CONFIG.projectileRadius)) {
+      if (pr.isBomb) triggerBombExplosion(state, pr);
+      continue;
+    }
     quantizeProjectileState(pr);
 
     let hit = null;
@@ -227,24 +401,55 @@ function updateProjectiles(state, dtMs) {
       continue;
     }
 
-    const target = state.players[hit];
-    const owner = state.players[pr.ownerId];
-
-    const absorbed = Math.min(target.shield, pr.damage);
-    target.shield -= absorbed;
-    const hpDamage = pr.damage - absorbed;
-    if (hpDamage > 0) target.hp = Math.max(0, target.hp - hpDamage);
-
-    if (owner) owner.stats.damageDealt += pr.damage;
-
-    if (target.hp <= 0 && target.alive) {
-      target.alive = false;
-      target.stats.deaths += 1;
-      if (owner) owner.stats.kills += 1;
+    // Hit!
+    if (pr.isBomb) {
+      triggerBombExplosion(state, pr);
+    } else {
+      // Normal projectile — direct HP damage (no shield)
+      const target = state.players[hit];
+      const owner = state.players[pr.ownerId];
+      target.hp = Math.max(0, target.hp - pr.damage);
+      if (owner) owner.stats.damageDealt += pr.damage;
+      if (target.hp <= 0 && target.alive) {
+        target.alive = false;
+        target.stats.deaths += 1;
+        if (owner) owner.stats.kills += 1;
+      }
     }
   }
 
   state.projectiles = kept;
+}
+
+function triggerBombExplosion(state, pr) {
+  const owner = state.players[pr.ownerId];
+  // Damage all players in blast radius (including owner!)
+  for (const [pid, p] of Object.entries(state.players)) {
+    if (!p.alive) continue;
+    const d = Math.hypot(p.x - pr.x, p.y - pr.y);
+    if (d <= CONFIG.bombRadius) {
+      const falloff = 1 - (d / CONFIG.bombRadius) * 0.6;
+      const dmg = Math.round(CONFIG.bombDamage * falloff);
+      // Self-damage is halved
+      const actualDmg = pid === pr.ownerId ? Math.round(dmg * 0.5) : dmg;
+      p.hp = Math.max(0, p.hp - actualDmg);
+      if (owner && pid !== pr.ownerId) owner.stats.damageDealt += actualDmg;
+      if (p.hp <= 0 && p.alive) {
+        p.alive = false;
+        p.stats.deaths += 1;
+        if (owner && pid !== pr.ownerId) owner.stats.kills += 1;
+      }
+    }
+  }
+  // Visual effect
+  state.effects.push({
+    type: 'explosion',
+    x: pr.x,
+    y: pr.y,
+    radius: CONFIG.bombRadius,
+    ownerId: pr.ownerId,
+    ttlMs: 500,
+  });
 }
 
 function spawnPickups(state) {
@@ -253,16 +458,22 @@ function spawnPickups(state) {
 
   const r1 = pseudoRandom(state.seed + state.tick * 7919);
   const r2 = pseudoRandom(state.seed + state.tick * 1543);
-  const minX = CONFIG.pickupRadius;
-  const maxX = state.arena.width - CONFIG.pickupRadius;
-  const minY = CONFIG.pickupRadius;
-  const maxY = state.arena.height - CONFIG.pickupRadius;
+  const r3 = pseudoRandom(state.seed + state.tick * 3571);
+  const minX = CONFIG.pickupRadius + 5;
+  const maxX = state.arena.width - CONFIG.pickupRadius - 5;
+  const minY = CONFIG.pickupRadius + 5;
+  const maxY = state.arena.height - CONFIG.pickupRadius - 5;
+
+  // Pick a random type from the 3 special weapons
+  const typeIndex = Math.floor(r3 * PICKUP_TYPES.length) % PICKUP_TYPES.length;
+  const pickupType = PICKUP_TYPES[typeIndex];
+
   state.pickups.push({
     id: `pu:${state.tick}:${state.pickups.length}`,
     x: roundState(minX + r1 * Math.max(0.0001, (maxX - minX))),
     y: roundState(minY + r2 * Math.max(0.0001, (maxY - minY))),
-    type: 'weapon_boost',
-    value: 1,
+    type: pickupType,
+    value: CONFIG.specialUsesPerPickup,
   });
 }
 
@@ -272,7 +483,7 @@ function collectPickups(state) {
     let collectorId = null;
     for (const [pid, p] of Object.entries(state.players)) {
       if (!p.alive) continue;
-      if (distSq(pickup.x, pickup.y, p.x, p.y) <= CONFIG.pickupRadius * CONFIG.pickupRadius) {
+      if (distSq(pickup.x, pickup.y, p.x, p.y) <= Math.pow(CONFIG.pickupRadius + CONFIG.playerRadius, 2)) {
         collectorId = pid;
         break;
       }
@@ -284,7 +495,10 @@ function collectPickups(state) {
     }
 
     const collector = state.players[collectorId];
-    collector.weaponLevel = clamp(collector.weaponLevel + pickup.value, 1, 5);
+    // Grant the special weapon
+    collector.specialWeapon = pickup.type;
+    collector.specialUses = pickup.value;
+    collector.laserActiveMs = 0;
     collector.stats.pickups += 1;
   }
 
@@ -305,7 +519,7 @@ function resolveTerminal(state) {
 
   if (state.remainingMs <= 0) {
     const ranked = Object.entries(state.players)
-      .map(([pid, p]) => ({ pid, score: p.hp + p.shield * 0.4 }))
+      .map(([pid, p]) => ({ pid, score: p.hp }))
       .sort((a, b) => b.score - a.score);
 
     const top = ranked[0]?.score ?? 0;
