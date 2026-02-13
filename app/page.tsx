@@ -63,8 +63,11 @@ type InputPayload = {
   fire: boolean;
   fire_pressed?: boolean;
   fire_seq?: number;
+  lag_comp_ms?: number;
   client_sent_at_ms?: number;
 };
+
+type LocalHit = { id: string; pid: string; t: number };
 type PendingInput = { transportSeq: number; payload: InputPayload; dtSec: number };
 type PerfHud = { fps: number; netGapMs: number; jitterMs: number; pendingInputs: number };
 type NetDebugHud = { mode: string; transport: string; rttMs: number | null };
@@ -89,7 +92,7 @@ const INPUT_SEND_MS_BASE = 16;
 const INPUT_SEND_MS_HIGH_RTT = 50;
 const HIGH_RTT_THRESHOLD = 100;
 const INTERP_DELAY_MS_LAN = Number(process.env.NEXT_PUBLIC_INTERP_DELAY_MS || 10);
-const INTERP_DELAY_MS_HIGH = 30;
+const INTERP_DELAY_MS_HIGH = 100; // Increased to 100ms for stable high-RTT buffer
 const UI_TICK_UPDATE_EVERY = 2;
 const MAX_PENDING_INPUTS = 120;
 const IMMEDIATE_INPUT_MIN_GAP_MS = 12;
@@ -610,6 +613,7 @@ export default function Page() {
   const localFireSeqRef = useRef(0);
   const lastInputSentAtRef = useRef(0);
   const lastImmediateInputSentAtRef = useRef(0);
+  const localHitsRef = useRef<LocalHit[]>([]);
   const lastSentFireRef = useRef(false);
   const brutalLocalPlayerRef = useRef<PlayerState | null>(null); // Only for BRUTAL_CLIENT_SIDE_MODE
   const joinedRef = useRef(false);
@@ -653,6 +657,7 @@ export default function Page() {
       ...input,
       fire_pressed: isFirePressed,
       fire_seq: fireSeq,
+      lag_comp_ms: (pingRef.current.emaRttMs / 2) + 15, // Send measured RTT/2 + 15ms buffer
       client_sent_at_ms: Date.now(),
     };
     usion.game.realtime("control", inputWithTiming);
@@ -1034,7 +1039,7 @@ export default function Page() {
       };
     }
 
-    drawWorld(renderState, canvas, myPid);
+    drawWorld(renderState, canvas, myPid, localHitsRef.current);
   }
 
   function getConfigRoomId(): string {
@@ -1450,7 +1455,7 @@ export default function Page() {
   );
 }
 
-function drawWorld(world: WorldState, canvas: HTMLCanvasElement, myId: string) {
+function drawWorld(world: WorldState, canvas: HTMLCanvasElement, myId: string, localHits: LocalHit[]) {
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
 
@@ -1466,6 +1471,12 @@ function drawWorld(world: WorldState, canvas: HTMLCanvasElement, myId: string) {
   const hpBarW = 48;
   const hpBarY = 30;
   const labelY = 38;
+
+  // Cleanup old local hit effects
+  const nowMs = performance.now();
+  while (localHits.length > 0 && nowMs - localHits[0].t > 150) {
+    localHits.shift();
+  }
 
   // --- Background ---
   const bg = ctx.createLinearGradient(0, 0, 0, h);
@@ -1616,6 +1627,23 @@ function drawWorld(world: WorldState, canvas: HTMLCanvasElement, myId: string) {
     const px = pr.x * sx;
     const py = pr.y * sy;
 
+    // Client-side instant hit detection for predicted bullets
+    if (pr.ownerId === myId) {
+      for (const [tid, target] of Object.entries(world.players)) {
+        if (tid === myId || !target.alive) continue;
+        const d2 = distanceSq(pr.x, pr.y, target.x, target.y);
+        const hitRad = PLAYER_RADIUS + PROJECTILE_RADIUS;
+        if (d2 <= hitRad * hitRad) {
+          if (!localHits.find((h: LocalHit) => h.id === pr.id)) {
+            localHits.push({ id: pr.id, pid: tid, t: performance.now() });
+          }
+          pr.ttlMs = 0; // Hide the bullet instantly on predicted hit
+        }
+      }
+    }
+
+    if (pr.ttlMs <= 0) continue;
+
     if (pr.isBomb) {
       // Bomb - glowing orange orb
       ctx.save();
@@ -1666,6 +1694,18 @@ function drawWorld(world: WorldState, canvas: HTMLCanvasElement, myId: string) {
       ctx.fillStyle = engineGrad;
       ctx.beginPath();
       ctx.arc(-shipTail, 0, 18, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // --- Hit Flash (Instant Feedback) ---
+    const isHit = localHits.some((h: LocalHit) => h.pid === pid);
+    if (isHit && p.alive) {
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.beginPath();
+      ctx.arc(0, 0, PLAYER_RADIUS * sx * 1.2, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(255, 255, 255, 0.4)";
       ctx.fill();
       ctx.restore();
     }
