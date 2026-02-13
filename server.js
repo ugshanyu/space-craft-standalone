@@ -21,8 +21,9 @@ const SIGNING_SECRET = process.env.SIGNING_SECRET || 'CHANGE_ME_IN_PRODUCTION';
 const MIN_PLAYERS = 2;
 const SIM_TICK_HZ = 60;
 const SIM_TICK_MS = Math.floor(1000 / SIM_TICK_HZ);
-const SNAPSHOT_HZ = 20;
-const SNAPSHOT_EVERY_TICKS = Math.max(1, Math.floor(SIM_TICK_HZ / SNAPSHOT_HZ));
+const NETWORK_HZ = Math.max(1, Number(process.env.NETWORK_HZ || 20));
+const NETWORK_EVERY_SIM_TICKS = Math.max(1, Math.floor(SIM_TICK_HZ / NETWORK_HZ));
+const FULL_SNAPSHOT_INTERVAL_NET_TICKS = Math.max(1, Number(process.env.FULL_SNAPSHOT_INTERVAL_NET_TICKS || NETWORK_HZ));
 const MAX_LAG_COMP_MS = 120;
 const MAX_CLIENT_INPUT_AGE_MS = 2000;
 
@@ -60,6 +61,7 @@ class RoomRuntime {
     this.tickHandle = null;
 
     this.serverTick = 0;
+    this.networkTick = 0;
     this.state = null;
 
     this.latestInputByUser = new Map(); // userId -> payload
@@ -167,6 +169,7 @@ class RoomRuntime {
     this.state = Game.initState(players, hashRoomId(this.roomId));
     this.running = true;
     this.serverTick = 0;
+    this.networkTick = 0;
 
     this.broadcast('game_start', {
       room_id: this.roomId,
@@ -199,29 +202,35 @@ class RoomRuntime {
 
     Game.tick(this.state, SIM_TICK_MS);
 
-    const payloadBase = {
-      room_id: this.roomId,
-      protocol_version: '2',
-      server_ts: Date.now(),
-      server_tick: this.serverTick,
-      ack_seq_by_player: this.ackSeqByPlayer,
-    };
+    if (this.serverTick % NETWORK_EVERY_SIM_TICKS === 0) {
+      this.networkTick += 1;
+      const networkState = toNetworkState(this.state);
+      const payloadBase = {
+        room_id: this.roomId,
+        protocol_version: '2',
+        server_ts: Date.now(),
+        server_tick: this.serverTick,
+        ack_seq_by_player: this.ackSeqByPlayer,
+      };
 
-    if (this.serverTick % SNAPSHOT_EVERY_TICKS === 0) {
-      const snapshotState = cloneState(this.state);
-      this.broadcast('state_snapshot', {
-        ...payloadBase,
-        full_state: snapshotState,
-      });
-      this.lastBroadcastState = snapshotState;
-    } else {
-      const delta = buildDelta(this.lastBroadcastState, this.state);
-      this.broadcast('state_delta', {
-        ...payloadBase,
-        changed_entities: delta.changed_entities,
-        removed_entities: delta.removed_entities,
-      });
-      this.lastBroadcastState = cloneState(this.state);
+      const shouldSendFullSnapshot = (
+        !this.lastBroadcastState ||
+        this.networkTick % FULL_SNAPSHOT_INTERVAL_NET_TICKS === 0
+      );
+      if (shouldSendFullSnapshot) {
+        this.broadcast('state_snapshot', {
+          ...payloadBase,
+          full_state: networkState,
+        });
+      } else {
+        const delta = buildDelta(this.lastBroadcastState, networkState);
+        this.broadcast('state_delta', {
+          ...payloadBase,
+          changed_entities: delta.changed_entities,
+          removed_entities: delta.removed_entities,
+        });
+      }
+      this.lastBroadcastState = networkState;
     }
 
     const terminal = Game.isTerminal(this.state);
@@ -277,23 +286,43 @@ class RoomRuntime {
   }
 }
 
-function cloneState(state) {
+function toNetworkState(state) {
   if (!state) return null;
   const players = {};
   for (const [pid, p] of Object.entries(state.players || {})) {
     players[pid] = {
-      ...p,
-      input: p.input ? { ...p.input } : { turn: 0, thrust: 0, fire: false, firePressed: false, lagCompMs: 0 },
-      stats: p.stats ? { ...p.stats } : { kills: 0, deaths: 0, damageDealt: 0, pickups: 0 },
+      id: String(p.id || pid),
+      x: Number(p.x || 0),
+      y: Number(p.y || 0),
+      vx: Number(p.vx || 0),
+      vy: Number(p.vy || 0),
+      angle: Number(p.angle || 0),
+      hp: Number(p.hp || 0),
+      shield: Number(p.shield || 0),
+      weaponLevel: Number(p.weaponLevel || 1),
+      alive: Boolean(p.alive),
     };
   }
   return {
-    ...state,
-    arena: { ...state.arena },
+    phase: String(state.phase || 'playing'),
+    tick: Number(state.tick || 0),
+    remainingMs: Number(state.remainingMs || 0),
     players,
-    projectiles: (state.projectiles || []).map((x) => ({ ...x })),
-    pickups: (state.pickups || []).map((x) => ({ ...x })),
-    winnerIds: [...(state.winnerIds || [])],
+    projectiles: (state.projectiles || []).map((x) => ({
+      id: String(x.id || ''),
+      ownerId: String(x.ownerId || ''),
+      x: Number(x.x || 0),
+      y: Number(x.y || 0),
+      vx: Number(x.vx || 0),
+      vy: Number(x.vy || 0),
+      ttlMs: Number(x.ttlMs || 0),
+    })),
+    pickups: (state.pickups || []).map((x) => ({
+      id: String(x.id || ''),
+      x: Number(x.x || 0),
+      y: Number(x.y || 0),
+      type: String(x.type || ''),
+    })),
   };
 }
 
@@ -337,6 +366,7 @@ function buildDelta(prevState, nextState) {
     return {
       changed_entities: {
         phase: nextState.phase,
+        tick: nextState.tick,
         remainingMs: nextState.remainingMs,
         players: nextState.players,
         projectiles: nextState.projectiles,
@@ -348,6 +378,9 @@ function buildDelta(prevState, nextState) {
 
   if (prevState.phase !== nextState.phase) {
     changed.phase = nextState.phase;
+  }
+  if (prevState.tick !== nextState.tick) {
+    changed.tick = nextState.tick;
   }
   if (prevState.remainingMs !== nextState.remainingMs) {
     changed.remainingMs = nextState.remainingMs;
@@ -574,6 +607,8 @@ app.prepare().then(() => {
   server.listen(PORT, (err) => {
     if (err) throw err;
     console.log(`> Ready on http://localhost:${PORT}`);
-    console.log(`[GAME] sim=${SIM_TICK_HZ}Hz snapshot=${SNAPSHOT_HZ}Hz`);
+    console.log(
+      `[GAME] sim=${SIM_TICK_HZ}Hz net=${NETWORK_HZ}Hz full_snapshot_every=${FULL_SNAPSHOT_INTERVAL_NET_TICKS} net_ticks`
+    );
   });
 });

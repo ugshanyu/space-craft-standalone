@@ -50,6 +50,7 @@ type InputPayload = {
   client_sent_at_ms?: number;
 };
 type PendingInput = { transportSeq: number; payload: InputPayload; dtSec: number };
+type PerfHud = { fps: number; netGapMs: number; jitterMs: number; pendingInputs: number };
 
 declare global {
   interface Window {
@@ -68,6 +69,7 @@ const MAX_PENDING_INPUTS = 120;
 const IMMEDIATE_INPUT_MIN_GAP_MS = 12;
 const UNSENT_PREDICTION_MAX_MS = INPUT_SEND_MS;
 const MAX_RENDER_DELTA_MS = 64;
+const EXPECTED_NET_UPDATE_MS = 50;
 
 const FIRE_COOLDOWN_MS = 180;
 const PROJECTILE_SPEED = 60;
@@ -219,6 +221,7 @@ function mergeDelta(base: WorldState | null, data: AnyObj): WorldState | null {
   const merged: WorldState = {
     ...base,
     phase: changed.phase !== undefined ? String(changed.phase) : base.phase,
+    tick: changed.tick !== undefined ? Number(changed.tick) : base.tick,
     remainingMs: changed.remainingMs !== undefined ? Number(changed.remainingMs) : base.remainingMs,
     players,
     projectiles: projectiles.map((x: AnyObj) => toProjectile(x)),
@@ -481,6 +484,7 @@ export default function Page() {
   const [joining, setJoining] = useState(false);
   const [playerCount, setPlayerCount] = useState(0);
   const [serverTick, setServerTick] = useState(0);
+  const [perfHud, setPerfHud] = useState<PerfHud>({ fps: 0, netGapMs: 0, jitterMs: 0, pendingInputs: 0 });
 
   const worldRef = useRef<WorldState | null>(null);
   const snapshotsRef = useRef<SnapshotFrame[]>([]);
@@ -490,6 +494,7 @@ export default function Page() {
   const lastNetworkTickRef = useRef(0);
 
   const inputTimerRef = useRef<number | null>(null);
+  const perfHudTimerRef = useRef<number | null>(null);
   const rafRef = useRef<number | null>(null);
   const connectGuardRef = useRef(false);
   const handlersBoundRef = useRef(false);
@@ -509,6 +514,8 @@ export default function Page() {
   const joinedRef = useRef(false);
   const gameStartedRef = useRef(false);
   const sendImmediateInputRef = useRef<() => void>(() => {});
+  const netStatsRef = useRef({ lastPacketAt: 0, emaGapMs: 0, jitterMs: 0 });
+  const fpsWindowRef = useRef({ startedAt: 0, frames: 0 });
 
   joinedRef.current = joined;
   gameStartedRef.current = gameStarted;
@@ -643,6 +650,30 @@ export default function Page() {
   }, []);
 
   useEffect(() => {
+    fpsWindowRef.current = { startedAt: performance.now(), frames: 0 };
+    perfHudTimerRef.current = window.setInterval(() => {
+      const now = performance.now();
+      const elapsedMs = Math.max(1, now - fpsWindowRef.current.startedAt);
+      const fps = Math.round((fpsWindowRef.current.frames * 1000) / elapsedMs);
+      fpsWindowRef.current.startedAt = now;
+      fpsWindowRef.current.frames = 0;
+      setPerfHud({
+        fps,
+        netGapMs: Math.round(netStatsRef.current.emaGapMs || 0),
+        jitterMs: Math.round(netStatsRef.current.jitterMs || 0),
+        pendingInputs: pendingInputsRef.current.length,
+      });
+    }, 500);
+
+    return () => {
+      if (perfHudTimerRef.current !== null) {
+        window.clearInterval(perfHudTimerRef.current);
+        perfHudTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     const usion = window.Usion;
     if (!usion?.game) return;
 
@@ -664,6 +695,7 @@ export default function Page() {
   useEffect(() => {
     return () => {
       if (inputTimerRef.current) window.clearInterval(inputTimerRef.current);
+      if (perfHudTimerRef.current) window.clearInterval(perfHudTimerRef.current);
       if (rafRef.current !== null) window.cancelAnimationFrame(rafRef.current);
       predictedProjectilesRef.current = [];
       pendingInputsRef.current = [];
@@ -672,6 +704,7 @@ export default function Page() {
       lastSentFireRef.current = false;
       localVisualPlayerRef.current = null;
       lastLocalCorrectionAtRef.current = 0;
+      netStatsRef.current = { lastPacketAt: 0, emaGapMs: 0, jitterMs: 0 };
       try { window.Usion?.game?.disconnect?.(); } catch {}
     };
   }, []);
@@ -681,6 +714,7 @@ export default function Page() {
     if (!canvas) return;
 
     const now = performance.now();
+    fpsWindowRef.current.frames += 1;
     const prevRenderAt = lastRenderAtRef.current ?? now - INPUT_SEND_MS;
     const frameDtMs = clamp(now - prevRenderAt, 0, MAX_RENDER_DELTA_MS);
     const frameDtSec = frameDtMs / 1000;
@@ -808,6 +842,20 @@ export default function Page() {
 
   function onNetworkState(data: AnyObj) {
     if (!data || data.room_id !== activeRoomIdRef.current) return;
+    const packetNow = performance.now();
+    if (netStatsRef.current.lastPacketAt > 0) {
+      const gapMs = packetNow - netStatsRef.current.lastPacketAt;
+      const prevEma = netStatsRef.current.emaGapMs || EXPECTED_NET_UPDATE_MS;
+      const emaGap = prevEma * 0.85 + gapMs * 0.15;
+      const jitterMs = netStatsRef.current.jitterMs * 0.85 + Math.abs(gapMs - emaGap) * 0.15;
+      netStatsRef.current.emaGapMs = emaGap;
+      netStatsRef.current.jitterMs = jitterMs;
+    } else {
+      netStatsRef.current.emaGapMs = EXPECTED_NET_UPDATE_MS;
+      netStatsRef.current.jitterMs = 0;
+    }
+    netStatsRef.current.lastPacketAt = packetNow;
+
     const tick = Number(data.server_tick || 0);
     if (tick > 0) {
       if (tick <= lastNetworkTickRef.current) return;
@@ -1035,7 +1083,10 @@ export default function Page() {
       >
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", color: "#dbeafe" }}>
           <h1 style={{ margin: 0, fontSize: "clamp(1.2rem, 2.6vw, 1.85rem)", fontWeight: 800 }}>Space Craft Duel</h1>
-          <div style={{ fontSize: 12, opacity: 0.9 }}>Tick {serverTick}</div>
+          <div style={{ fontSize: 11, opacity: 0.9, textAlign: "right", lineHeight: 1.35 }}>
+            <div>Tick {serverTick}</div>
+            <div>FPS {perfHud.fps} | gap {perfHud.netGapMs}ms | jitter {perfHud.jitterMs}ms | q {perfHud.pendingInputs}</div>
+          </div>
         </div>
 
         <div style={{ color: "#93c5fd", fontSize: 13 }}>
