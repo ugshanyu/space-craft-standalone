@@ -15,9 +15,10 @@ const CANVAS_SIZE = 900;
 const INPUT_INTERVAL_MS = 50;
 const JOIN_RETRY_LIMIT = Number(process.env.NEXT_PUBLIC_JOIN_RETRY_LIMIT || 4);
 const JOIN_RETRY_BACKOFF_MS = 700;
+const UI_TICK_UPDATE_EVERY = 4;
 
 function isFireKey(event: KeyboardEvent): boolean {
-  return event.code === "Space" || event.key === " " || event.key === "Spacebar";
+  return event.code === "KeyE" || event.key.toLowerCase() === "e";
 }
 
 function isControlKey(event: KeyboardEvent): boolean {
@@ -54,6 +55,8 @@ export default function Page() {
   const handlersBoundRef = useRef(false);
   const activeRoomIdRef = useRef<string>("");
   const myUserIdRef = useRef<string>("");
+  const animationFrameRef = useRef<number | null>(null);
+  const lastUiTickRef = useRef(0);
 
   const world = predictedRef.current || worldRef.current;
   const players = Object.entries(world?.players || {}) as Array<[string, AnyObj]>;
@@ -108,10 +111,17 @@ export default function Page() {
   }, []);
 
   useEffect(() => {
-    const renderLoop = window.setInterval(() => {
+    const render = () => {
       drawWorld(predictedRef.current || worldRef.current, canvasRef.current, myId);
-    }, 33);
-    return () => window.clearInterval(renderLoop);
+      animationFrameRef.current = window.requestAnimationFrame(render);
+    };
+    animationFrameRef.current = window.requestAnimationFrame(render);
+    return () => {
+      if (animationFrameRef.current !== null) {
+        window.cancelAnimationFrame(animationFrameRef.current);
+        animationFrameRef.current = null;
+      }
+    };
   }, [myId]);
 
   useEffect(() => {
@@ -176,7 +186,6 @@ export default function Page() {
 
     me.x = ((Number(me.x || 0) + me.vx * dt) % 100 + 100) % 100;
     me.y = ((Number(me.y || 0) + me.vy * dt) % 100 + 100) % 100;
-    predictedRef.current = structuredClone(state);
   }
 
   function reconcileFromServer(snapshotOrDelta: AnyObj): void {
@@ -281,7 +290,11 @@ export default function Page() {
           if (data.room_id !== activeRoomIdRef.current) return;
           if (data.protocol_version === "2") {
             setGameStarted(true);
-            setServerTick(Number(data.server_tick || 0));
+            const tick = Number(data.server_tick || 0);
+            if (tick - lastUiTickRef.current >= UI_TICK_UPDATE_EVERY || tick < lastUiTickRef.current) {
+              lastUiTickRef.current = tick;
+              setServerTick(tick);
+            }
             reconcileFromServer(data);
           }
         });
@@ -289,7 +302,11 @@ export default function Page() {
         usion.game.onStateUpdate((data: AnyObj) => {
           if (data.room_id !== activeRoomIdRef.current) return;
           setGameStarted(true);
-          setServerTick(Number(data.server_tick || 0));
+          const tick = Number(data.server_tick || 0);
+          if (tick - lastUiTickRef.current >= UI_TICK_UPDATE_EVERY || tick < lastUiTickRef.current) {
+            lastUiTickRef.current = tick;
+            setServerTick(tick);
+          }
           reconcileFromServer(data);
         });
 
@@ -502,7 +519,7 @@ export default function Page() {
 
         <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "center", fontSize: 12, color: "#93c5fd" }}>
           <span>Move: W/A/D or Arrow keys</span>
-          <span>Fire: Space</span>
+          <span>Fire: E</span>
           <span>Weapon boosts: yellow crates (W+)</span>
           {players.map(([pid, p]) => (
             <span
@@ -555,11 +572,12 @@ function drawWorld(world: AnyObj | null, canvas: HTMLCanvasElement | null, myId:
     ctx.stroke();
   }
 
-  for (let i = 0; i < 65; i++) {
-    const x = (Math.sin((world.tick || 0) * 0.02 + i * 13.7) * 0.5 + 0.5) * width;
-    const y = (Math.cos((world.tick || 0) * 0.012 + i * 9.1) * 0.5 + 0.5) * height;
-    const alpha = 0.25 + ((i * 17) % 70) / 100;
-    ctx.fillStyle = `rgba(147, 197, 253, ${alpha.toFixed(2)})`;
+  const tick = Number(world.tick || 0);
+  for (let i = 0; i < 28; i++) {
+    const x = ((i * 37) % 100) * scaleX + (((tick + i * 11) % 50) / 50) * 0.6;
+    const y = ((i * 53) % 100) * scaleY + (((tick + i * 7) % 50) / 50) * 0.6;
+    const alpha = 0.3 + ((tick + i * 13) % 10) * 0.03;
+    ctx.fillStyle = `rgba(147, 197, 253, ${alpha})`;
     ctx.fillRect(x, y, 1.5, 1.5);
   }
 
