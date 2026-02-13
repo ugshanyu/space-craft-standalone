@@ -57,6 +57,8 @@ export default function Page() {
   const myUserIdRef = useRef<string>("");
   const animationFrameRef = useRef<number | null>(null);
   const lastUiTickRef = useRef(0);
+  const lastServerTimeRef = useRef(Date.now());
+  const lastInputTimeRef = useRef(Date.now());
 
   const world = predictedRef.current || worldRef.current;
   const players = Object.entries(world?.players || {}) as Array<[string, AnyObj]>;
@@ -112,7 +114,10 @@ export default function Page() {
 
   useEffect(() => {
     const render = () => {
-      drawWorld(predictedRef.current || worldRef.current, canvasRef.current, myId);
+      const now = Date.now();
+      const dtLocal = (now - lastInputTimeRef.current) / 1000;
+      const dtRemote = (now - lastServerTimeRef.current) / 1000;
+      drawWorld(predictedRef.current || worldRef.current, canvasRef.current, myId, dtLocal, dtRemote);
       animationFrameRef.current = window.requestAnimationFrame(render);
     };
     animationFrameRef.current = window.requestAnimationFrame(render);
@@ -133,6 +138,7 @@ export default function Page() {
         const input = buildInputFromKeys();
         pendingInputsRef.current.push(input);
         applyLocalPrediction(input);
+        lastInputTimeRef.current = Date.now();
         usion.game.realtime("control", input.payload);
       }, INPUT_INTERVAL_MS);
     }
@@ -209,6 +215,8 @@ export default function Page() {
     pendingInputsRef.current = pendingInputsRef.current.filter((ev) => ev.seq > lastAckRef.current);
     predictedRef.current = structuredClone(worldRef.current);
     for (const ev of pendingInputsRef.current) applyLocalPrediction(ev);
+    lastServerTimeRef.current = Date.now();
+    lastInputTimeRef.current = Date.now();
   }
 
   async function sleep(ms: number): Promise<void> {
@@ -541,7 +549,7 @@ export default function Page() {
   );
 }
 
-function drawWorld(world: AnyObj | null, canvas: HTMLCanvasElement | null, myId: string): void {
+function drawWorld(world: AnyObj | null, canvas: HTMLCanvasElement | null, myId: string, dtLocal: number = 0, dtRemote: number = 0): void {
   if (!world || !canvas) return;
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
@@ -550,6 +558,11 @@ function drawWorld(world: AnyObj | null, canvas: HTMLCanvasElement | null, myId:
   const height = canvas.height;
   const scaleX = width / 100;
   const scaleY = height / 100;
+
+  // Clamp dt to avoid huge jumps if tab was backgrounded
+  const maxDt = 0.2;
+  const safeDtLocal = Math.min(dtLocal, maxDt);
+  const safeDtRemote = Math.min(dtRemote, maxDt);
 
   const spaceGradient = ctx.createLinearGradient(0, 0, 0, height);
   spaceGradient.addColorStop(0, "#08122a");
@@ -613,8 +626,16 @@ function drawWorld(world: AnyObj | null, canvas: HTMLCanvasElement | null, myId:
 
   const projectiles = world.projectiles || [];
   for (const proj of projectiles) {
-    const x = Number(proj.x || 0) * scaleX;
-    const y = Number(proj.y || 0) * scaleY;
+    let px = Number(proj.x || 0) + Number(proj.vx || 0) * safeDtRemote;
+    let py = Number(proj.y || 0) + Number(proj.vy || 0) * safeDtRemote;
+    
+    // Wrap
+    px = ((px % 100) + 100) % 100;
+    py = ((py % 100) + 100) % 100;
+
+    const x = px * scaleX;
+    const y = py * scaleY;
+
     ctx.shadowBlur = 14;
     ctx.shadowColor = "rgba(244, 63, 94, 0.9)";
     ctx.fillStyle = "#fb7185";
@@ -627,9 +648,20 @@ function drawWorld(world: AnyObj | null, canvas: HTMLCanvasElement | null, myId:
   const players = world.players || {};
   const entries = Object.entries(players) as Array<[string, AnyObj]>;
   for (const [pid, player] of entries) {
-    const x = Number(player.x || 0) * scaleX;
-    const y = Number(player.y || 0) * scaleY;
-    const angle = Number(player.angle || 0);
+    const isMe = pid === myId;
+    const dt = isMe ? safeDtLocal : safeDtRemote;
+    
+    let px = Number(player.x || 0) + Number(player.vx || 0) * dt;
+    let py = Number(player.y || 0) + Number(player.vy || 0) * dt;
+    
+    // Wrap
+    px = ((px % 100) + 100) % 100;
+    py = ((py % 100) + 100) % 100;
+
+    const x = px * scaleX;
+    const y = py * scaleY;
+    
+    const angle = Number(player.angle || 0); // Not extrapolating angle for simplicity
     const hp = Math.max(0, Number(player.hp || 0));
     const shield = Math.max(0, Number(player.shield || 0));
     const weaponLevel = Math.max(1, Number(player.weaponLevel || 1));

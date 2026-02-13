@@ -174,8 +174,8 @@ function advanceProjectiles(state, dtMs) {
   for (const proj of state.projectiles) {
     proj.ttlMs -= dtMs;
     if (proj.ttlMs <= 0) continue;
-    proj.x = _round((proj.x + proj.vx * (dtMs / 1000.0)) % arenaWidth);
-    proj.y = _round((proj.y + proj.vy * (dtMs / 1000.0)) % arenaHeight);
+    proj.x = _round(((proj.x + proj.vx * (dtMs / 1000.0)) % arenaWidth + arenaWidth) % arenaWidth);
+    proj.y = _round(((proj.y + proj.vy * (dtMs / 1000.0)) % arenaHeight + arenaHeight) % arenaHeight);
     let hitPlayerId = null;
     for (const [pid, p] of Object.entries(state.players)) {
       if (pid === proj.ownerId || !p.alive) continue;
@@ -266,8 +266,10 @@ function resolveTerminal(state) {
 }
 
 function distSq(ax, ay, bx, by) {
-  const dx = ax - bx;
-  const dy = ay - by;
+  let dx = Math.abs(ax - bx);
+  let dy = Math.abs(ay - by);
+  if (dx > CONFIG.arenaWidth / 2) dx = CONFIG.arenaWidth - dx;
+  if (dy > CONFIG.arenaHeight / 2) dy = CONFIG.arenaHeight - dy;
   return dx * dx + dy * dy;
 }
 
