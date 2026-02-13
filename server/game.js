@@ -122,7 +122,7 @@ export function tick(state, dtMs) {
       state.projectiles.push({
         id: `${state.tick}-${pid}`,
         ownerId: pid,
-        x: Number(p.x), y: Number(p.y),
+        x: p.x, y: p.y,
         vx: _round(Math.cos(p.angle) * CONFIG.projectileSpeed),
         vy: _round(Math.sin(p.angle) * CONFIG.projectileSpeed),
         ttlMs: CONFIG.projectileTtlMs,
@@ -169,7 +169,8 @@ export function buildDelta(prevState, currState) {
 }
 
 function advanceProjectiles(state, dtMs) {
-  const { arenaWidth, arenaHeight } = state.arena;
+  const arenaWidth = state.arena.width;
+  const arenaHeight = state.arena.height;
   const kept = [];
   for (const proj of state.projectiles) {
     proj.ttlMs -= dtMs;

@@ -626,13 +626,8 @@ function drawWorld(world: AnyObj | null, canvas: HTMLCanvasElement | null, myId:
 
   const projectiles = world.projectiles || [];
   for (const proj of projectiles) {
-    const rawX = proj.x;
-    const rawY = proj.y;
-    // Skip invalid projectiles to avoid rendering artifacts at (0,0)
-    if (typeof rawX !== 'number' || typeof rawY !== 'number') continue;
-
-    let px = rawX + Number(proj.vx || 0) * safeDtRemote;
-    let py = rawY + Number(proj.vy || 0) * safeDtRemote;
+    let px = Number(proj.x || 0) + Number(proj.vx || 0) * safeDtRemote;
+    let py = Number(proj.y || 0) + Number(proj.vy || 0) * safeDtRemote;
     
     // Wrap
     px = ((px % 100) + 100) % 100;
