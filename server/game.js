@@ -122,7 +122,7 @@ export function tick(state, dtMs) {
       state.projectiles.push({
         id: `${state.tick}-${pid}`,
         ownerId: pid,
-        x: p.x, y: p.y,
+        x: Number(p.x), y: Number(p.y),
         vx: _round(Math.cos(p.angle) * CONFIG.projectileSpeed),
         vy: _round(Math.sin(p.angle) * CONFIG.projectileSpeed),
         ttlMs: CONFIG.projectileTtlMs,
