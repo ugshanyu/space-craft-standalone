@@ -77,6 +77,14 @@ const PREDICTED_PROJECTILE_BRIDGE_MS = 450;
 const PROJECTILE_RECONCILE_DIST = 2.6;
 const PROJECTILE_RECONCILE_DIST_LAX = 12;
 
+const POS_ERROR_SOFT = 0.45;
+const POS_ERROR_HARD = 2.2;
+const VEL_ERROR_SOFT = 1.3;
+const ANGLE_ERROR_SOFT = 0.12;
+const ANGLE_ERROR_HARD = 0.85;
+const CORRECTION_SMOOTH_MS = 110;
+const CORRECTION_MIN_INTERVAL_MS = 55;
+
 const TURN_RATE = 3.8;
 const ACCEL_FORWARD = 55;
 const ACCEL_REVERSE = 28;
@@ -232,6 +240,13 @@ function lerpAngle(a: number, b: number, t: number): number {
   while (d > Math.PI) d -= Math.PI * 2;
   while (d < -Math.PI) d += Math.PI * 2;
   return a + d * t;
+}
+
+function shortestAngleDelta(a: number, b: number): number {
+  let d = b - a;
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  return d;
 }
 
 function torusDistanceSq(ax: number, ay: number, bx: number, by: number, size: number): number {
@@ -411,6 +426,50 @@ function suppressLocalAuthoritativeDuplicates(
   return out;
 }
 
+function reconcileLocalPlayerVisual(
+  prevVisual: PlayerState | null,
+  authoritative: PlayerState,
+  dtSec: number,
+  nowMs: number,
+  lastCorrectionAtMs: number,
+): { player: PlayerState; corrected: boolean } {
+  if (!prevVisual) return { player: { ...authoritative }, corrected: true };
+  if (!authoritative.alive) return { player: { ...authoritative }, corrected: true };
+
+  const posError = Math.sqrt(torusDistanceSq(prevVisual.x, prevVisual.y, authoritative.x, authoritative.y, 100));
+  const velError = Math.hypot(prevVisual.vx - authoritative.vx, prevVisual.vy - authoritative.vy);
+  const angleError = Math.abs(shortestAngleDelta(prevVisual.angle, authoritative.angle));
+
+  if (posError < POS_ERROR_SOFT && velError < VEL_ERROR_SOFT && angleError < ANGLE_ERROR_SOFT) {
+    return { player: prevVisual, corrected: false };
+  }
+
+  if (posError >= POS_ERROR_HARD || angleError >= ANGLE_ERROR_HARD) {
+    return { player: { ...authoritative }, corrected: true };
+  }
+
+  if (nowMs - lastCorrectionAtMs < CORRECTION_MIN_INTERVAL_MS) {
+    return { player: prevVisual, corrected: false };
+  }
+
+  const alpha = clamp((dtSec * 1000) / CORRECTION_SMOOTH_MS, 0.08, 0.85);
+  return {
+    corrected: true,
+    player: {
+      ...prevVisual,
+      x: wrap(prevVisual.x + shortestWrapDelta(prevVisual.x, authoritative.x, 100) * alpha, 100),
+      y: wrap(prevVisual.y + shortestWrapDelta(prevVisual.y, authoritative.y, 100) * alpha, 100),
+      vx: prevVisual.vx + (authoritative.vx - prevVisual.vx) * alpha,
+      vy: prevVisual.vy + (authoritative.vy - prevVisual.vy) * alpha,
+      angle: normalizeAngle(lerpAngle(prevVisual.angle, authoritative.angle, alpha)),
+      hp: authoritative.hp,
+      shield: authoritative.shield,
+      weaponLevel: authoritative.weaponLevel,
+      alive: authoritative.alive,
+    },
+  };
+}
+
 export default function Page() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
@@ -445,6 +504,8 @@ export default function Page() {
   const lastInputSentAtRef = useRef(0);
   const lastImmediateInputSentAtRef = useRef(0);
   const lastSentFireRef = useRef(false);
+  const localVisualPlayerRef = useRef<PlayerState | null>(null);
+  const lastLocalCorrectionAtRef = useRef(0);
   const joinedRef = useRef(false);
   const gameStartedRef = useRef(false);
   const sendImmediateInputRef = useRef<() => void>(() => {});
@@ -609,6 +670,8 @@ export default function Page() {
       localFireCooldownMsRef.current = 0;
       lastRenderAtRef.current = null;
       lastSentFireRef.current = false;
+      localVisualPlayerRef.current = null;
+      lastLocalCorrectionAtRef.current = 0;
       try { window.Usion?.game?.disconnect?.(); } catch {}
     };
   }, []);
@@ -663,11 +726,21 @@ export default function Page() {
       const newest = snapshots[snapshots.length - 1]?.state;
       const newestMe = newest?.players?.[myPid];
       if (newestMe) {
+        const reconciled = reconcileLocalPlayerVisual(
+          localVisualPlayerRef.current,
+          newestMe,
+          frameDtSec,
+          now,
+          lastLocalCorrectionAtRef.current,
+        );
+        if (reconciled.corrected) {
+          lastLocalCorrectionAtRef.current = now;
+        }
         renderState = {
           ...renderState,
           players: {
             ...renderState.players,
-            [myPid]: { ...newestMe },
+            [myPid]: { ...reconciled.player },
           },
         };
       }
@@ -696,9 +769,13 @@ export default function Page() {
         renderState.projectiles,
         myPid,
       );
+      if (renderState.players[myPid]) {
+        localVisualPlayerRef.current = { ...renderState.players[myPid] };
+      }
     } else if (predictedProjectilesRef.current.length > 0) {
       predictedProjectilesRef.current = [];
       localFireCooldownMsRef.current = 0;
+      localVisualPlayerRef.current = null;
     }
 
     if (predictedProjectilesRef.current.length > 0) {
@@ -805,6 +882,8 @@ export default function Page() {
     localFireCooldownMsRef.current = 0;
     lastRenderAtRef.current = null;
     lastSentFireRef.current = false;
+    localVisualPlayerRef.current = null;
+    lastLocalCorrectionAtRef.current = 0;
 
     const uid = String(usion.user?.getId?.() || "");
     myIdRef.current = uid;
@@ -829,6 +908,8 @@ export default function Page() {
           lastInputSentAtRef.current = performance.now() - INPUT_SEND_MS;
           localFireCooldownMsRef.current = 0;
           lastSentFireRef.current = false;
+          localVisualPlayerRef.current = null;
+          lastLocalCorrectionAtRef.current = 0;
           setJoined(true);
           setPlayerCount((data?.player_ids || []).length);
           const waiting = Number(data?.waiting_for || 0);
@@ -848,6 +929,8 @@ export default function Page() {
           localFireCooldownMsRef.current = 0;
           predictedProjectilesRef.current = [];
           lastSentFireRef.current = false;
+          localVisualPlayerRef.current = null;
+          lastLocalCorrectionAtRef.current = 0;
           setGameStarted(true);
           setStatus("Fight");
         });
@@ -862,6 +945,8 @@ export default function Page() {
           predictedProjectilesRef.current = [];
           localFireCooldownMsRef.current = 0;
           lastSentFireRef.current = false;
+          localVisualPlayerRef.current = null;
+          lastLocalCorrectionAtRef.current = 0;
           setGameStarted(false);
           setStatus(`Match ended (${data?.reason || "done"})`);
         });
@@ -893,6 +978,8 @@ export default function Page() {
           localFireCooldownMsRef.current = 0;
           lastInputSentAtRef.current = performance.now() - INPUT_SEND_MS;
           lastSentFireRef.current = false;
+          localVisualPlayerRef.current = null;
+          lastLocalCorrectionAtRef.current = 0;
           setJoined(true);
           setPlayerCount((joinRes?.player_ids || []).length);
           const waiting = Number(joinRes?.waiting_for || 0);
