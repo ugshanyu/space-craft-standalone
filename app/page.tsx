@@ -114,6 +114,25 @@ export default function Page() {
     return () => window.clearInterval(renderLoop);
   }, [myId]);
 
+  useEffect(() => {
+    const usion = window.Usion;
+    if (!usion?.game) return;
+
+    if (gameStarted && joined && !inputTimerRef.current) {
+      inputTimerRef.current = window.setInterval(() => {
+        const input = buildInputFromKeys();
+        pendingInputsRef.current.push(input);
+        applyLocalPrediction(input);
+        usion.game.realtime("control", input.payload);
+      }, INPUT_INTERVAL_MS);
+    }
+
+    if (!gameStarted && inputTimerRef.current) {
+      window.clearInterval(inputTimerRef.current);
+      inputTimerRef.current = null;
+    }
+  }, [gameStarted, joined, myId]);
+
   function getConfigRoomId(): string {
     const params = new URLSearchParams(window.location.search);
     const queryRoomId = params.get("roomId");
@@ -256,14 +275,6 @@ export default function Page() {
           setPlayerCount((data.player_ids || []).length);
           setWaitingFor(0);
           setStatus("Game started! Fight!");
-
-          if (inputTimerRef.current) window.clearInterval(inputTimerRef.current);
-          inputTimerRef.current = window.setInterval(() => {
-            const input = buildInputFromKeys();
-            pendingInputsRef.current.push(input);
-            applyLocalPrediction(input);
-            usion.game.realtime("control", input.payload);
-          }, INPUT_INTERVAL_MS);
         });
 
         usion.game.onRealtime((data: AnyObj) => {
@@ -290,7 +301,10 @@ export default function Page() {
 
         usion.game.onError((data: AnyObj) => {
           if (data.room_id && data.room_id !== activeRoomIdRef.current) return;
-          setStatus(`Server error: ${data.code || "unknown"}`);
+          const details = [data.code || "unknown", data.reason, data.expectedGt ? `expected>${data.expectedGt}` : ""]
+            .filter(Boolean)
+            .join(" | ");
+          setStatus(`Server error: ${details}`);
         });
       }
 

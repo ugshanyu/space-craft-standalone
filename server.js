@@ -87,6 +87,9 @@ class RoomRuntime {
   addSession(sessionId, userId, ws) {
     this.sessions.set(sessionId, { userId, ws });
     this.connectedUserIds.add(userId);
+    // A (re)join creates a fresh direct stream from seq=1 on the client SDK.
+    // Reset per-player ack baseline to avoid permanent NON_MONOTONIC_SEQ rejects.
+    this.ackSeqByPlayer[userId] = 0;
   }
 
   removeSession(sessionId) {
@@ -290,6 +293,9 @@ function handleMessage(ws, session, msg) {
 
     // Idempotent join: same session reconnect/join retries should not duplicate state.
     if (room.sessions.has(session.sessionId)) {
+      // Rebind websocket for the same session (tab refresh/reconnect).
+      // Keep room membership but reset input ack so the restarted client seq is accepted.
+      room.addSession(session.sessionId, session.userId, ws);
       const waitingFor = Math.max(0, room.minPlayers - room.connectedUserIds.size);
       sendJson(ws, {
         type: 'joined',
