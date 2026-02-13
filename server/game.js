@@ -60,7 +60,7 @@ export function initState(playerIds, seed) {
       weaponLevel: 1,
       fireCooldownMs: 0,
       alive: true,
-      input: { turn: 0, thrust: 0, fire: false, firePressed: false, lagCompMs: 0 },
+      input: { turn: 0, thrust: 0, fire: false, firePressed: false, fireSeq: null, lagCompMs: 0 },
       stats: {
         kills: 0,
         deaths: 0,
@@ -90,11 +90,13 @@ export function initState(playerIds, seed) {
 export function applyInput(state, playerId, payload) {
   const p = state.players[playerId];
   if (!p || !p.alive) return;
+  const incomingFireSeq = Number(payload?.fire_seq);
   p.input = {
     turn: clamp(Number(payload?.turn || 0), -1, 1),
     thrust: clamp(Number(payload?.thrust || 0), -1, 1),
     fire: Boolean(payload?.fire),
     firePressed: Boolean(payload?.fire_pressed),
+    fireSeq: Number.isFinite(incomingFireSeq) && incomingFireSeq > 0 ? Math.floor(incomingFireSeq) : null,
     lagCompMs: clamp(Number(payload?.lag_comp_ms || 0), 0, CONFIG.maxLagCompensationMs),
   };
 }
@@ -139,12 +141,13 @@ export function tick(state, dtMs) {
     p.fireCooldownMs = Math.max(0, p.fireCooldownMs - dtMs);
     p.shield = Math.min(CONFIG.maxShield, p.shield + CONFIG.shieldRegenPerSecond * dt);
 
-    if (p.input.fire && p.fireCooldownMs <= 0) {
+    if (p.input.firePressed && p.fireCooldownMs <= 0) {
       const lagCompMs = p.input.firePressed ? p.input.lagCompMs : 0;
-      spawnProjectile(state, pid, p, lagCompMs);
+      spawnProjectile(state, pid, p, lagCompMs, p.input.fireSeq);
       p.fireCooldownMs = CONFIG.fireCooldownMs;
     }
     p.input.firePressed = false;
+    p.input.fireSeq = null;
   }
 
   updateProjectiles(state, dtMs);
@@ -165,7 +168,7 @@ export function isTerminal(state) {
   };
 }
 
-function spawnProjectile(state, ownerId, p, lagCompMs = 0) {
+function spawnProjectile(state, ownerId, p, lagCompMs = 0, fireSeq = null) {
   const muzzle = 2.0;
   const minX = CONFIG.projectileRadius;
   const maxX = state.arena.width - CONFIG.projectileRadius;
@@ -179,6 +182,7 @@ function spawnProjectile(state, ownerId, p, lagCompMs = 0) {
     vx: Math.cos(p.angle) * CONFIG.projectileSpeed,
     vy: Math.sin(p.angle) * CONFIG.projectileSpeed,
     ttlMs: CONFIG.projectileTtlMs,
+    fireSeq: Number.isFinite(Number(fireSeq)) && Number(fireSeq) > 0 ? Math.floor(Number(fireSeq)) : undefined,
     damage: CONFIG.projectileDamage + (p.weaponLevel - 1) * 3,
   };
 

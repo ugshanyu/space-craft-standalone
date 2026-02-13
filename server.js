@@ -17,11 +17,12 @@ const JWKS_URL = process.env.JWKS_URL || `${API_URL}/.well-known/jwks.json`;
 const SERVICE_ID = process.env.SERVICE_ID || null;
 const SIGNING_KEY_ID = process.env.SIGNING_KEY_ID || 'space-craft-key-1';
 const SIGNING_SECRET = process.env.SIGNING_SECRET || 'CHANGE_ME_IN_PRODUCTION';
+const DEPLOY_REGION = process.env.RAILWAY_REGION || process.env.AWS_REGION || process.env.FLY_REGION || 'unknown';
 
 const MIN_PLAYERS = 2;
 const SIM_TICK_HZ = 60;
 const SIM_TICK_MS = Math.floor(1000 / SIM_TICK_HZ);
-const NETWORK_HZ = Math.max(1, Number(process.env.NETWORK_HZ || 20));
+const NETWORK_HZ = Math.max(1, Number(process.env.NETWORK_HZ || 30));
 const NETWORK_EVERY_SIM_TICKS = Math.max(1, Math.floor(SIM_TICK_HZ / NETWORK_HZ));
 const FULL_SNAPSHOT_INTERVAL_NET_TICKS = Math.max(1, Number(process.env.FULL_SNAPSHOT_INTERVAL_NET_TICKS || NETWORK_HZ));
 const MAX_LAG_COMP_MS = 120;
@@ -316,6 +317,7 @@ function toNetworkState(state) {
       vx: Number(x.vx || 0),
       vy: Number(x.vy || 0),
       ttlMs: Number(x.ttlMs || 0),
+      fireSeq: Number.isFinite(Number(x.fireSeq)) ? Number(x.fireSeq) : undefined,
     })),
     pickups: (state.pickups || []).map((x) => ({
       id: String(x.id || ''),
@@ -607,6 +609,7 @@ app.prepare().then(() => {
   server.listen(PORT, (err) => {
     if (err) throw err;
     console.log(`> Ready on http://localhost:${PORT}`);
+    console.log(`[GAME] region=${DEPLOY_REGION}`);
     console.log(
       `[GAME] sim=${SIM_TICK_HZ}Hz net=${NETWORK_HZ}Hz full_snapshot_every=${FULL_SNAPSHOT_INTERVAL_NET_TICKS} net_ticks`
     );

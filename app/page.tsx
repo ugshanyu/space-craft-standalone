@@ -25,6 +25,7 @@ type ProjectileState = {
   vx: number;
   vy: number;
   ttlMs: number;
+  fireSeq?: number;
 };
 
 type WorldState = {
@@ -47,6 +48,7 @@ type InputPayload = {
   thrust: number;
   fire: boolean;
   fire_pressed?: boolean;
+  fire_seq?: number;
   client_sent_at_ms?: number;
 };
 type PendingInput = { transportSeq: number; payload: InputPayload; dtSec: number };
@@ -67,7 +69,7 @@ const WORLD_SIZE = 100;
 const PLAYER_RADIUS = 1.5;
 const PROJECTILE_RADIUS = 0.45;
 const INPUT_SEND_MS = 33;
-const INTERP_DELAY_MS = BRUTAL_CLIENT_SIDE_MODE ? 20 : 45;
+const INTERP_DELAY_MS = Number(process.env.NEXT_PUBLIC_INTERP_DELAY_MS || (BRUTAL_CLIENT_SIDE_MODE ? 20 : 28));
 const UI_TICK_UPDATE_EVERY = 2;
 const MAX_PENDING_INPUTS = 120;
 const IMMEDIATE_INPUT_MIN_GAP_MS = 12;
@@ -122,6 +124,7 @@ function normalizeAngle(v: number): number {
 }
 
 function toProjectile(raw: AnyObj): ProjectileState {
+  const fireSeq = Number(raw?.fireSeq ?? raw?.fire_seq);
   return {
     id: String(raw?.id || ""),
     x: Number(raw?.x || 0),
@@ -130,6 +133,7 @@ function toProjectile(raw: AnyObj): ProjectileState {
     vx: Number(raw?.vx || 0),
     vy: Number(raw?.vy || 0),
     ttlMs: Number(raw?.ttlMs || 0),
+    fireSeq: Number.isFinite(fireSeq) && fireSeq > 0 ? Math.floor(fireSeq) : undefined,
   };
 }
 
@@ -399,7 +403,7 @@ function advanceProjectile(projectile: ProjectileState, dtSec: number, maxAgeMs:
   };
 }
 
-function makePredictedProjectile(myId: string, ship: PlayerState, id: string): ProjectileState {
+function makePredictedProjectile(myId: string, ship: PlayerState, id: string, fireSeq?: number): ProjectileState {
   return {
     id,
     ownerId: myId,
@@ -408,6 +412,7 @@ function makePredictedProjectile(myId: string, ship: PlayerState, id: string): P
     vx: Math.cos(ship.angle) * PROJECTILE_SPEED,
     vy: Math.sin(ship.angle) * PROJECTILE_SPEED,
     ttlMs: Math.min(PROJECTILE_TTL_MS, PREDICTED_PROJECTILE_BRIDGE_MS),
+    fireSeq,
   };
 }
 
@@ -422,8 +427,25 @@ function reconcilePredictedProjectiles(
   const strictDistSq = PROJECTILE_RECONCILE_DIST * PROJECTILE_RECONCILE_DIST;
   const laxDistSq = PROJECTILE_RECONCILE_DIST_LAX * PROJECTILE_RECONCILE_DIST_LAX;
   const used = new Set<number>();
+  const byFireSeq = new Map<number, number[]>();
+  for (let i = 0; i < mine.length; i++) {
+    const seq = mine[i].fireSeq;
+    if (!seq) continue;
+    const bucket = byFireSeq.get(seq) || [];
+    bucket.push(i);
+    byFireSeq.set(seq, bucket);
+  }
   const out: ProjectileState[] = [];
   for (const localShot of predicted) {
+    if (localShot.fireSeq) {
+      const bucket = byFireSeq.get(localShot.fireSeq) || [];
+      const seqMatch = bucket.find((i) => !used.has(i));
+      if (seqMatch !== undefined) {
+        used.add(seqMatch);
+        continue;
+      }
+    }
+
     let matchIdx = -1;
     for (let i = 0; i < mine.length; i++) {
       if (used.has(i)) continue;
@@ -450,10 +472,17 @@ function suppressLocalAuthoritativeDuplicates(
 ): ProjectileState[] {
   if (!myId || predicted.length === 0) return authoritative;
   const suppressDistSq = PROJECTILE_RECONCILE_DIST_LAX * PROJECTILE_RECONCILE_DIST_LAX;
+  const predictedFireSeqs = new Set<number>();
+  for (const localPr of predicted) {
+    if (localPr.fireSeq) predictedFireSeqs.add(localPr.fireSeq);
+  }
   const out: ProjectileState[] = [];
   for (const pr of authoritative) {
     if (pr.ownerId !== myId) {
       out.push(pr);
+      continue;
+    }
+    if (pr.fireSeq && predictedFireSeqs.has(pr.fireSeq)) {
       continue;
     }
     const duplicatesPredicted = predicted.some((localPr) => distanceSq(localPr.x, localPr.y, pr.x, pr.y) <= suppressDistSq);
@@ -539,6 +568,7 @@ export default function Page() {
   const localFireCooldownMsRef = useRef(0);
   const predictedProjectilesRef = useRef<ProjectileState[]>([]);
   const predictedProjectileSeqRef = useRef(0);
+  const localFireSeqRef = useRef(0);
   const lastInputSentAtRef = useRef(0);
   const lastImmediateInputSentAtRef = useRef(0);
   const lastSentFireRef = useRef(false);
@@ -561,9 +591,11 @@ export default function Page() {
   function sendControlInput(usion: AnyObj, input: InputPayload, sentAtMs = performance.now()) {
     const isFirePressed = Boolean(input.fire && !lastSentFireRef.current);
     lastSentFireRef.current = Boolean(input.fire);
+    const fireSeq = isFirePressed ? (localFireSeqRef.current += 1) : undefined;
     const inputWithTiming: InputPayload = {
       ...input,
       fire_pressed: isFirePressed,
+      fire_seq: fireSeq,
       client_sent_at_ms: Date.now(),
     };
     usion.game.realtime("control", inputWithTiming);
@@ -577,6 +609,18 @@ export default function Page() {
       pendingInputsRef.current.push({ transportSeq, payload: inputWithTiming, dtSec });
       if (pendingInputsRef.current.length > MAX_PENDING_INPUTS) {
         pendingInputsRef.current.splice(0, pendingInputsRef.current.length - MAX_PENDING_INPUTS);
+      }
+    }
+
+    if (!BRUTAL_CLIENT_SIDE_MODE && fireSeq && joinedRef.current && gameStartedRef.current) {
+      const myPid = myIdRef.current;
+      const ship = myPid ? (localVisualPlayerRef.current || worldRef.current?.players?.[myPid]) : null;
+      if (myPid && ship?.alive) {
+        predictedProjectileSeqRef.current += 1;
+        predictedProjectilesRef.current.push(
+          makePredictedProjectile(myPid, ship, `pred:${myPid}:${predictedProjectileSeqRef.current}`, fireSeq),
+        );
+        localFireCooldownMsRef.current = FIRE_COOLDOWN_MS;
       }
     }
   }
@@ -731,6 +775,7 @@ export default function Page() {
       if (perfHudTimerRef.current) window.clearInterval(perfHudTimerRef.current);
       if (rafRef.current !== null) window.cancelAnimationFrame(rafRef.current);
       predictedProjectilesRef.current = [];
+      localFireSeqRef.current = 0;
       pendingInputsRef.current = [];
       localFireCooldownMsRef.current = 0;
       lastRenderAtRef.current = null;
@@ -835,17 +880,6 @@ export default function Page() {
         const unsentMs = clamp(now - lastInputSentAtRef.current, 0, UNSENT_PREDICTION_MAX_MS);
         if (unsentMs > 0) {
           renderState = applyLocalPrediction(renderState, myPid, buildInputFromKeys(keysRef.current), unsentMs / 1000);
-        }
-      }
-
-      if (!BRUTAL_CLIENT_SIDE_MODE && joinedRef.current && gameStartedRef.current && keysRef.current.fire && localFireCooldownMsRef.current <= 0) {
-        const predictedMe = renderState.players[myPid];
-        if (predictedMe?.alive) {
-          predictedProjectileSeqRef.current += 1;
-          predictedProjectilesRef.current.push(
-            makePredictedProjectile(myPid, predictedMe, `pred:${myPid}:${predictedProjectileSeqRef.current}`),
-          );
-          localFireCooldownMsRef.current = FIRE_COOLDOWN_MS;
         }
       }
 
@@ -989,6 +1023,7 @@ export default function Page() {
     activeRoomIdRef.current = rid;
     predictedProjectilesRef.current = [];
     predictedProjectileSeqRef.current = 0;
+    localFireSeqRef.current = 0;
     localFireCooldownMsRef.current = 0;
     lastRenderAtRef.current = null;
     lastSentFireRef.current = false;
@@ -1013,6 +1048,7 @@ export default function Page() {
           pendingInputsRef.current = [];
           predictedProjectilesRef.current = [];
           predictedProjectileSeqRef.current = 0;
+          localFireSeqRef.current = 0;
           lastAckSeqRef.current = 0;
           lastNetworkTickRef.current = 0;
           lastInputSentAtRef.current = performance.now() - INPUT_SEND_MS;
@@ -1038,6 +1074,7 @@ export default function Page() {
           lastInputSentAtRef.current = performance.now() - INPUT_SEND_MS;
           localFireCooldownMsRef.current = 0;
           predictedProjectilesRef.current = [];
+          localFireSeqRef.current = 0;
           lastSentFireRef.current = false;
           localVisualPlayerRef.current = null;
           lastLocalCorrectionAtRef.current = 0;
@@ -1053,6 +1090,7 @@ export default function Page() {
           if (data?.room_id && data.room_id !== activeRoomIdRef.current) return;
           pendingInputsRef.current = [];
           predictedProjectilesRef.current = [];
+          localFireSeqRef.current = 0;
           localFireCooldownMsRef.current = 0;
           lastSentFireRef.current = false;
           localVisualPlayerRef.current = null;
@@ -1085,6 +1123,7 @@ export default function Page() {
 
           predictedProjectilesRef.current = [];
           predictedProjectileSeqRef.current = 0;
+          localFireSeqRef.current = 0;
           localFireCooldownMsRef.current = 0;
           lastInputSentAtRef.current = performance.now() - INPUT_SEND_MS;
           lastSentFireRef.current = false;
