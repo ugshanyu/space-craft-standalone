@@ -11,11 +11,26 @@ declare global {
   }
 }
 
-const WIDTH = 420;
-const HEIGHT = 420;
+const CANVAS_SIZE = 900;
 const INPUT_INTERVAL_MS = 50;
 const JOIN_RETRY_LIMIT = Number(process.env.NEXT_PUBLIC_JOIN_RETRY_LIMIT || 4);
 const JOIN_RETRY_BACKOFF_MS = 700;
+
+function isFireKey(event: KeyboardEvent): boolean {
+  return event.code === "Space" || event.key === " " || event.key === "Spacebar";
+}
+
+function isControlKey(event: KeyboardEvent): boolean {
+  const k = event.key.toLowerCase();
+  return (
+    k === "w" ||
+    k === "a" ||
+    k === "s" ||
+    k === "d" ||
+    event.key.startsWith("Arrow") ||
+    isFireKey(event)
+  );
+}
 
 export default function Page() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -40,34 +55,55 @@ export default function Page() {
   const activeRoomIdRef = useRef<string>("");
   const myUserIdRef = useRef<string>("");
 
+  const world = predictedRef.current || worldRef.current;
+  const players = Object.entries(world?.players || {}) as Array<[string, AnyObj]>;
+
   useEffect(() => {
     if (window.Usion?._initialized) {
       return;
-    } else if (window.Usion) {
+    }
+    if (window.Usion) {
       window.Usion.init();
     }
   }, []);
 
   useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "ArrowUp" || e.key.toLowerCase() === "w") keyStateRef.current.up = true;
-      if (e.key === "ArrowDown" || e.key.toLowerCase() === "s") keyStateRef.current.down = true;
-      if (e.key === "ArrowLeft" || e.key.toLowerCase() === "a") keyStateRef.current.left = true;
-      if (e.key === "ArrowRight" || e.key.toLowerCase() === "d") keyStateRef.current.right = true;
-      if (e.key === " ") keyStateRef.current.fire = true;
+    const resetKeys = () => {
+      keyStateRef.current = { up: false, down: false, left: false, right: false, fire: false };
     };
-    const onKeyUp = (e: KeyboardEvent) => {
-      if (e.key === "ArrowUp" || e.key.toLowerCase() === "w") keyStateRef.current.up = false;
-      if (e.key === "ArrowDown" || e.key.toLowerCase() === "s") keyStateRef.current.down = false;
-      if (e.key === "ArrowLeft" || e.key.toLowerCase() === "a") keyStateRef.current.left = false;
-      if (e.key === "ArrowRight" || e.key.toLowerCase() === "d") keyStateRef.current.right = false;
-      if (e.key === " ") keyStateRef.current.fire = false;
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (isControlKey(event)) event.preventDefault();
+      const key = event.key.toLowerCase();
+      if (event.key === "ArrowUp" || key === "w") keyStateRef.current.up = true;
+      if (event.key === "ArrowDown" || key === "s") keyStateRef.current.down = true;
+      if (event.key === "ArrowLeft" || key === "a") keyStateRef.current.left = true;
+      if (event.key === "ArrowRight" || key === "d") keyStateRef.current.right = true;
+      if (isFireKey(event)) keyStateRef.current.fire = true;
     };
+
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (isControlKey(event)) event.preventDefault();
+      const key = event.key.toLowerCase();
+      if (event.key === "ArrowUp" || key === "w") keyStateRef.current.up = false;
+      if (event.key === "ArrowDown" || key === "s") keyStateRef.current.down = false;
+      if (event.key === "ArrowLeft" || key === "a") keyStateRef.current.left = false;
+      if (event.key === "ArrowRight" || key === "d") keyStateRef.current.right = false;
+      if (isFireKey(event)) keyStateRef.current.fire = false;
+    };
+
+    const focusWindow = () => window.focus();
+
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", resetKeys);
+    window.addEventListener("pointerdown", focusWindow);
+
     return () => {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", resetKeys);
+      window.removeEventListener("pointerdown", focusWindow);
     };
   }, []);
 
@@ -79,23 +115,23 @@ export default function Page() {
   }, [myId]);
 
   function getConfigRoomId(): string {
-    const p = new URLSearchParams(window.location.search);
-    const q = p.get("roomId");
-    if (q) return q;
+    const params = new URLSearchParams(window.location.search);
+    const queryRoomId = params.get("roomId");
+    if (queryRoomId) return queryRoomId;
     const cfg = window.Usion?.config;
     return cfg?.roomId || "";
   }
 
   function buildInputFromKeys(): InputEvent {
-    const k = keyStateRef.current;
-    const turn = k.left ? -1 : k.right ? 1 : 0;
-    const thrust = k.up ? 1 : k.down ? -0.4 : 0;
+    const keys = keyStateRef.current;
+    const turn = keys.left ? -1 : keys.right ? 1 : 0;
+    const thrust = keys.up ? 1 : keys.down ? -0.4 : 0;
     seqRef.current += 1;
     return {
       seq: seqRef.current,
       input_type: "control",
       client_ts: Date.now(),
-      payload: { turn, thrust, fire: k.fire }
+      payload: { turn, thrust, fire: keys.fire },
     };
   }
 
@@ -108,10 +144,8 @@ export default function Page() {
     const turn = Number(input.payload.turn || 0);
     const thrust = Number(input.payload.thrust || 0);
 
-    // Steering
     me.angle = Number(me.angle || 0) + turn * 4.2 * dt;
 
-    // Speed: always moving forward, W = boost
     const baseSpeed = 8;
     const maxSpeed = 28;
     const targetSpeed = baseSpeed + thrust * (maxSpeed - baseSpeed);
@@ -136,10 +170,12 @@ export default function Page() {
         ...snapshotOrDelta.changed_entities,
         players: snapshotOrDelta.changed_entities.players || worldRef.current.players,
         projectiles: snapshotOrDelta.changed_entities.projectiles || worldRef.current.projectiles,
-        pickups: snapshotOrDelta.changed_entities.pickups || worldRef.current.pickups
+        pickups: snapshotOrDelta.changed_entities.pickups || worldRef.current.pickups,
       };
     }
+
     if (!worldRef.current) return;
+
     const ack = Number(snapshotOrDelta.ack_seq_by_player?.[myId] || 0);
     lastAckRef.current = Math.max(lastAckRef.current, ack);
     pendingInputsRef.current = pendingInputsRef.current.filter((ev) => ev.seq > lastAckRef.current);
@@ -159,11 +195,13 @@ export default function Page() {
       setStatus("SDK not ready");
       return;
     }
+
     const rid = getConfigRoomId();
     if (!rid) {
       setStatus("Missing roomId");
       return;
     }
+
     setRoomId(rid);
     activeRoomIdRef.current = rid;
     const uid = String(usion.user?.getId?.() || "");
@@ -177,7 +215,6 @@ export default function Page() {
       if (!handlersBoundRef.current) {
         handlersBoundRef.current = true;
 
-        // Setup event handlers once so reload retries do not stack duplicate listeners.
         usion.game.onJoined((data: AnyObj) => {
           if (data?.room_id && data.room_id !== activeRoomIdRef.current) return;
           const pids = Array.from(new Set((data.player_ids || []).map(String)));
@@ -197,8 +234,6 @@ export default function Page() {
             if (data?.room_id && data.room_id !== activeRoomIdRef.current) return;
             const pids = Array.from(new Set((data.player_ids || []).map(String)));
             const joinedPlayerId = String(data.player_id || "");
-            // Server broadcasts player_joined to everyone including the joiner.
-            // Ignore self-echo when still alone to avoid sticky "waiting" status.
             if (joinedPlayerId && joinedPlayerId === myUserIdRef.current && pids.length <= 1) {
               return;
             }
@@ -262,7 +297,9 @@ export default function Page() {
       let lastErr: any = null;
       for (let attempt = 1; attempt <= JOIN_RETRY_LIMIT; attempt++) {
         try {
-          try { usion.game.disconnect?.(); } catch {}
+          try {
+            usion.game.disconnect?.();
+          } catch {}
           await sleep(120);
           await usion.game.connectDirect();
           setStatus("Connected, joining room...");
@@ -284,7 +321,9 @@ export default function Page() {
         } catch (err: any) {
           lastErr = err;
           const msg = String(err?.message || err);
-          try { usion.game.disconnect?.(); } catch {}
+          try {
+            usion.game.disconnect?.();
+          } catch {}
           if (!msg.includes("code=1006") || attempt === JOIN_RETRY_LIMIT) {
             throw err;
           }
@@ -312,43 +351,160 @@ export default function Page() {
   }, []);
 
   return (
-    <main style={{ minHeight: "100vh", display: "grid", placeItems: "center", padding: 20 }}>
-      <div style={{ width: "min(760px, 100%)", display: "grid", gap: 12 }}>
-        <h1 style={{ margin: 0 }}>Space Craft (Direct Mode v2)</h1>
-        <div style={{ color: "#94a3b8", fontSize: 14 }}>
-          Room: {roomId || "unknown"} | Tick: {serverTick} | {joined ? "connected" : "not joined"}
+    <main
+      style={{
+        height: "100dvh",
+        overflow: "hidden",
+        padding: "16px",
+        background:
+          "radial-gradient(circle at 20% 10%, #0b1a36 0%, #061229 32%, #020617 100%)",
+        display: "grid",
+        placeItems: "center",
+        boxSizing: "border-box",
+      }}
+    >
+      <div
+        style={{
+          width: "min(980px, 100%)",
+          height: "100%",
+          display: "grid",
+          gridTemplateRows: "auto auto auto auto minmax(0, 1fr) auto",
+          gap: 10,
+          background: "linear-gradient(180deg, rgba(15,23,42,0.95), rgba(2,6,23,0.96))",
+          border: "1px solid rgba(71,85,105,0.5)",
+          borderRadius: 16,
+          padding: 14,
+          boxShadow: "0 18px 45px rgba(2, 6, 23, 0.45)",
+          boxSizing: "border-box",
+        }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 12 }}>
+          <h1 style={{ margin: 0, color: "#f8fafc", fontWeight: 800, fontSize: "clamp(1.4rem, 2.5vw, 2rem)" }}>
+            Space Craft Arena
+          </h1>
+          <div style={{ color: "#93c5fd", fontSize: 12, fontWeight: 600 }}>Tick {serverTick}</div>
         </div>
-        {joined && (
-          <div style={{
-            display: "flex", alignItems: "center", gap: 12, padding: "8px 12px",
-            borderRadius: 8, background: gameStarted ? "#064e3b" : "#1e293b", fontSize: 13,
-          }}>
-            <div style={{
-              width: 8, height: 8, borderRadius: "50%",
+
+        <div style={{ color: "#93c5fd", fontSize: 13 }}>
+          Room: {roomId || "unknown"} | {joined ? "connected" : "not joined"}
+        </div>
+
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
+            borderRadius: 10,
+            border: "1px solid rgba(71,85,105,0.6)",
+            background: gameStarted ? "rgba(6,95,70,0.35)" : "rgba(30,41,59,0.7)",
+            color: "#e2e8f0",
+            fontSize: 13,
+            fontWeight: 600,
+            padding: "9px 12px",
+          }}
+        >
+          <div
+            style={{
+              width: 9,
+              height: 9,
+              borderRadius: "50%",
               background: gameStarted ? "#34d399" : waitingFor > 0 ? "#fbbf24" : "#34d399",
-              animation: waitingFor > 0 ? "pulse 1.5s infinite" : "none",
-            }} />
-            <span style={{ color: "#e2e8f0" }}>
-              {gameStarted
-                ? `Game in progress - ${playerCount} players`
-                : waitingFor > 0
-                  ? `Players: ${playerCount}/2 - Waiting for ${waitingFor} more player(s)...`
-                  : `Players: ${playerCount}/2 - Ready!`}
-            </span>
-          </div>
-        )}
-        {!joined && (
+              boxShadow: "0 0 12px currentColor",
+            }}
+          />
+          <span>
+            {gameStarted
+              ? `Fight live - ${playerCount} players active`
+              : waitingFor > 0
+                ? `Players ${playerCount}/2 - waiting for ${waitingFor}`
+                : `Players ${playerCount}/2 - ready`}
+          </span>
+        </div>
+
+        {!joined ? (
           <button
             onClick={connectAndJoin}
             disabled={joining}
-            style={{ padding: "10px 12px", borderRadius: 8, border: "1px solid #334155", background: "#0f172a", color: "#e2e8f0" }}
+            style={{
+              height: 42,
+              borderRadius: 10,
+              border: "1px solid #2563eb",
+              background: "linear-gradient(180deg, #3b82f6, #2563eb)",
+              color: "#eff6ff",
+              fontWeight: 700,
+              fontSize: 14,
+              cursor: joining ? "progress" : "pointer",
+            }}
           >
-            {joining ? "Connecting..." : "Connect + Join (Direct)"}
+            {joining ? "Connecting..." : "Connect + Join"}
           </button>
+        ) : (
+          <div style={{ color: "#dbeafe", fontSize: 13 }}>{status}</div>
         )}
-        <div style={{ color: "#cbd5e1" }}>{status}</div>
-        <canvas ref={canvasRef} width={WIDTH} height={HEIGHT} style={{ border: "1px solid #1e293b", borderRadius: 8, background: "#030712" }} />
-        <div style={{ fontSize: 13, color: "#94a3b8" }}>Controls: W/A/D or Arrow Up/Left/Right, Space to fire.</div>
+
+        <div
+          style={{
+            minHeight: 0,
+            display: "grid",
+            placeItems: "center",
+            borderRadius: 14,
+            border: "1px solid rgba(56, 189, 248, 0.25)",
+            background: "linear-gradient(180deg, rgba(2,6,23,0.96), rgba(3,7,18,0.96))",
+            overflow: "hidden",
+            position: "relative",
+          }}
+        >
+          <canvas
+            ref={canvasRef}
+            width={CANVAS_SIZE}
+            height={CANVAS_SIZE}
+            style={{
+              width: "min(calc(100dvh - 320px), calc(100vw - 70px), 760px)",
+              height: "auto",
+              aspectRatio: "1 / 1",
+              display: "block",
+              maxHeight: "100%",
+            }}
+          />
+          {!gameStarted && joined && (
+            <div
+              style={{
+                position: "absolute",
+                top: 12,
+                right: 12,
+                background: "rgba(15,23,42,0.75)",
+                border: "1px solid rgba(56,189,248,0.4)",
+                color: "#bae6fd",
+                borderRadius: 8,
+                padding: "6px 8px",
+                fontSize: 12,
+                fontWeight: 600,
+              }}
+            >
+              Match starts when both players are ready
+            </div>
+          )}
+        </div>
+
+        <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "center", fontSize: 12, color: "#93c5fd" }}>
+          <span>Move: W/A/D or Arrow keys</span>
+          <span>Fire: Space</span>
+          <span>Weapon boosts: yellow crates (W+)</span>
+          {players.map(([pid, p]) => (
+            <span
+              key={pid}
+              style={{
+                padding: "4px 8px",
+                borderRadius: 999,
+                border: "1px solid rgba(71,85,105,0.7)",
+                background: pid === myId ? "rgba(6,182,212,0.16)" : "rgba(245,158,11,0.14)",
+                color: "#e2e8f0",
+              }}
+            >
+              {pid === myId ? "You" : "Enemy"} HP {Math.round(Number(p.hp || 0))} SH {Math.round(Number(p.shield || 0))} W{Math.max(1, Number(p.weaponLevel || 1))}
+            </span>
+          ))}
+        </div>
       </div>
     </main>
   );
@@ -358,47 +514,144 @@ function drawWorld(world: AnyObj | null, canvas: HTMLCanvasElement | null, myId:
   if (!world || !canvas) return;
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.fillStyle = "#030712";
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  const sx = canvas.width / 100;
-  const sy = canvas.height / 100;
-  const players = world.players || {};
-  const entries = Object.entries(players) as Array<[string, AnyObj]>;
-  for (const [pid, p] of entries) {
-    const x = Number(p.x || 0) * sx;
-    const y = Number(p.y || 0) * sy;
-    const angle = Number(p.angle || 0);
-    ctx.save();
-    ctx.translate(x, y);
-    ctx.rotate(angle);
-    ctx.fillStyle = pid === myId ? "#22d3ee" : "#f59e0b";
-    if (!p.alive) ctx.fillStyle = "#64748b";
+  const width = canvas.width;
+  const height = canvas.height;
+  const scaleX = width / 100;
+  const scaleY = height / 100;
+
+  const spaceGradient = ctx.createLinearGradient(0, 0, 0, height);
+  spaceGradient.addColorStop(0, "#08122a");
+  spaceGradient.addColorStop(1, "#030712");
+  ctx.fillStyle = spaceGradient;
+  ctx.fillRect(0, 0, width, height);
+
+  ctx.strokeStyle = "rgba(56, 189, 248, 0.08)";
+  ctx.lineWidth = 1;
+  for (let i = 10; i < 100; i += 10) {
+    const gx = i * scaleX;
+    const gy = i * scaleY;
     ctx.beginPath();
-    ctx.moveTo(8, 0);
-    ctx.lineTo(-6, 5);
-    ctx.lineTo(-6, -5);
-    ctx.closePath();
-    ctx.fill();
-    ctx.restore();
-
-    ctx.fillStyle = "#e2e8f0";
-    ctx.font = "11px sans-serif";
-    ctx.fillText(`HP ${p.hp} SH ${Math.floor(Number(p.shield || 0))}`, x - 24, y - 10);
+    ctx.moveTo(gx, 0);
+    ctx.lineTo(gx, height);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(0, gy);
+    ctx.lineTo(width, gy);
+    ctx.stroke();
   }
 
-  const projectiles = world.projectiles || [];
-  ctx.fillStyle = "#f43f5e";
-  for (const proj of projectiles) {
-    ctx.beginPath();
-    ctx.arc(Number(proj.x || 0) * sx, Number(proj.y || 0) * sy, 2.5, 0, Math.PI * 2);
-    ctx.fill();
+  for (let i = 0; i < 65; i++) {
+    const x = (Math.sin((world.tick || 0) * 0.02 + i * 13.7) * 0.5 + 0.5) * width;
+    const y = (Math.cos((world.tick || 0) * 0.012 + i * 9.1) * 0.5 + 0.5) * height;
+    const alpha = 0.25 + ((i * 17) % 70) / 100;
+    ctx.fillStyle = `rgba(147, 197, 253, ${alpha.toFixed(2)})`;
+    ctx.fillRect(x, y, 1.5, 1.5);
   }
 
   const pickups = world.pickups || [];
-  ctx.fillStyle = "#a3e635";
-  for (const pu of pickups) {
-    ctx.fillRect(Number(pu.x || 0) * sx - 3, Number(pu.y || 0) * sy - 3, 6, 6);
+  for (const pickup of pickups) {
+    const px = Number(pickup.x || 0) * scaleX;
+    const py = Number(pickup.y || 0) * scaleY;
+
+    ctx.save();
+    ctx.translate(px, py);
+    ctx.rotate(((world.tick || 0) * 0.04) % (Math.PI * 2));
+
+    ctx.shadowBlur = 16;
+    ctx.shadowColor = "rgba(250, 204, 21, 0.7)";
+    ctx.fillStyle = "#facc15";
+    ctx.beginPath();
+    ctx.moveTo(0, -9);
+    ctx.lineTo(9, 0);
+    ctx.lineTo(0, 9);
+    ctx.lineTo(-9, 0);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#1f2937";
+    ctx.fillRect(-4, -1.8, 8, 3.6);
+    ctx.restore();
+
+    ctx.fillStyle = "#fde68a";
+    ctx.font = "bold 11px system-ui";
+    ctx.fillText("W+", px - 9, py - 12);
+  }
+
+  const projectiles = world.projectiles || [];
+  for (const proj of projectiles) {
+    const x = Number(proj.x || 0) * scaleX;
+    const y = Number(proj.y || 0) * scaleY;
+    ctx.shadowBlur = 14;
+    ctx.shadowColor = "rgba(244, 63, 94, 0.9)";
+    ctx.fillStyle = "#fb7185";
+    ctx.beginPath();
+    ctx.arc(x, y, 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+
+  const players = world.players || {};
+  const entries = Object.entries(players) as Array<[string, AnyObj]>;
+  for (const [pid, player] of entries) {
+    const x = Number(player.x || 0) * scaleX;
+    const y = Number(player.y || 0) * scaleY;
+    const angle = Number(player.angle || 0);
+    const hp = Math.max(0, Number(player.hp || 0));
+    const shield = Math.max(0, Number(player.shield || 0));
+    const weaponLevel = Math.max(1, Number(player.weaponLevel || 1));
+
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(angle);
+
+    if (player.alive) {
+      ctx.fillStyle = pid === myId ? "#22d3ee" : "#f59e0b";
+      ctx.shadowBlur = 18;
+      ctx.shadowColor = pid === myId ? "rgba(34,211,238,0.8)" : "rgba(245,158,11,0.8)";
+    } else {
+      ctx.fillStyle = "#64748b";
+      ctx.shadowBlur = 0;
+    }
+
+    ctx.beginPath();
+    ctx.moveTo(14, 0);
+    ctx.lineTo(-10, 8);
+    ctx.lineTo(-7, 0);
+    ctx.lineTo(-10, -8);
+    ctx.closePath();
+    ctx.fill();
+
+    const velocity = Math.hypot(Number(player.vx || 0), Number(player.vy || 0));
+    if (player.alive && velocity > 10) {
+      ctx.fillStyle = "rgba(125, 211, 252, 0.95)";
+      ctx.beginPath();
+      ctx.moveTo(-9, 0);
+      ctx.lineTo(-17, 3.5);
+      ctx.lineTo(-17, -3.5);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    ctx.shadowBlur = 0;
+    ctx.restore();
+
+    const barY = y - 18;
+    const hpWidth = 32;
+    ctx.fillStyle = "rgba(15, 23, 42, 0.8)";
+    ctx.fillRect(x - hpWidth / 2, barY, hpWidth, 4);
+    ctx.fillStyle = "#22c55e";
+    ctx.fillRect(x - hpWidth / 2, barY, (hp / 100) * hpWidth, 4);
+
+    ctx.fillStyle = "rgba(15, 23, 42, 0.8)";
+    ctx.fillRect(x - hpWidth / 2, barY + 5, hpWidth, 3);
+    ctx.fillStyle = "#60a5fa";
+    ctx.fillRect(x - hpWidth / 2, barY + 5, (shield / 60) * hpWidth, 3);
+
+    ctx.fillStyle = "#f8fafc";
+    ctx.font = "bold 12px system-ui";
+    const label = pid === myId ? "YOU" : "RIVAL";
+    ctx.fillText(`${label} W${weaponLevel}`, x - 20, y - 26);
   }
 }

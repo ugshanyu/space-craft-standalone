@@ -43,10 +43,22 @@ export async function validateAccessToken(token, {
   jwksUrl,
   expectedIssuer = 'usion-backend',
   expectedAudiencePrefix = 'usion-game-service:',
-  expectedServiceId,
+  expectedServiceId = null,
   expectedRoomId = null,
 }) {
-  const expectedAudience = `${expectedAudiencePrefix}${expectedServiceId}`;
+  let tokenServiceId = null;
+  try {
+    const decoded = decodeJwt(token);
+    tokenServiceId = decoded?.service_id ? String(decoded.service_id) : null;
+  } catch {
+    tokenServiceId = null;
+  }
+
+  const resolvedServiceId = expectedServiceId || tokenServiceId;
+  if (!resolvedServiceId) {
+    throw new Error('Token missing service_id and expectedServiceId is not configured');
+  }
+  const expectedAudience = `${expectedAudiencePrefix}${resolvedServiceId}`;
 
   // Optional diagnostics (disabled by default to reduce auth path latency/log noise).
   if (AUTH_DIAG) {
@@ -83,8 +95,8 @@ export async function validateAccessToken(token, {
     const { payload } = verified;
 
     // Additional claim checks
-    if (payload.service_id !== expectedServiceId) {
-      throw new Error(`Token service_id mismatch: ${payload.service_id} != ${expectedServiceId}`);
+    if (payload.service_id !== resolvedServiceId) {
+      throw new Error(`Token service_id mismatch: ${payload.service_id} != ${resolvedServiceId}`);
     }
 
     if (expectedRoomId && payload.room_id !== expectedRoomId) {

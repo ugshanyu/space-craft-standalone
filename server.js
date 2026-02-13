@@ -13,9 +13,9 @@ const handle = app.getRequestHandler();
 const PORT = process.env.PORT || 3000;
 
 // Game Server Config
-const SERVICE_ID = process.env.SERVICE_ID || 'space-craft';
-const JWKS_URL = process.env.JWKS_URL || 'http://localhost:8000/.well-known/jwks.json';
-const API_URL = process.env.API_URL || 'http://localhost:8000';
+const API_URL = (process.env.API_URL || 'https://mobile.mongolai.mn').replace(/\/$/, '');
+const JWKS_URL = process.env.JWKS_URL || `${API_URL}/.well-known/jwks.json`;
+const SERVICE_ID = process.env.SERVICE_ID || null;
 const SIGNING_KEY_ID = process.env.SIGNING_KEY_ID || 'space-craft-key-1';
 const SIGNING_SECRET = process.env.SIGNING_SECRET || 'CHANGE_ME_IN_PRODUCTION';
 const TICK_RATE_HZ = 20;
@@ -47,8 +47,9 @@ process.on('uncaughtException', (err) => {
 });
 
 class RoomRuntime {
-  constructor(roomId, playerIds, minPlayers) {
+  constructor(roomId, serviceId, playerIds, minPlayers) {
     this.roomId = roomId;
+    this.serviceId = serviceId || null;
     this.playerIds = playerIds;
     this.minPlayers = minPlayers || MIN_PLAYERS;
     this.connectedUserIds = new Set();
@@ -216,9 +217,12 @@ class RoomRuntime {
     this.broadcast('match_end', matchEndPayload);
 
     try {
+      if (!this.serviceId) {
+        throw new Error('Missing service_id for result submission');
+      }
       await submitMatchResult({
         apiUrl: API_URL,
-        serviceId: SERVICE_ID,
+        serviceId: this.serviceId,
         signingKeyId: SIGNING_KEY_ID,
         signingSecret: SIGNING_SECRET,
         roomId: this.roomId,
@@ -280,7 +284,7 @@ function handleMessage(ws, session, msg) {
   if (type === 'join') {
     let room = rooms.get(session.roomId);
     if (!room) {
-      room = new RoomRuntime(session.roomId, [], MIN_PLAYERS);
+      room = new RoomRuntime(session.roomId, session.serviceId, [], MIN_PLAYERS);
       rooms.set(session.roomId, room);
     }
 
@@ -387,7 +391,7 @@ app.prepare().then(() => {
     const url = new URL(req.url, `http://localhost:${PORT}`);
     const token = url.searchParams.get('token');
     
-    let session = { userId: null, roomId: null, sessionId: null };
+    let session = { userId: null, roomId: null, sessionId: null, serviceId: null };
     let pendingMessages = [];
     let authComplete = false;
 
@@ -432,6 +436,7 @@ app.prepare().then(() => {
         session.userId = payload.sub;
         session.roomId = payload.room_id;
         session.sessionId = payload.session_id;
+        session.serviceId = payload.service_id || null;
         authComplete = true;
         if (ws.readyState !== ws.OPEN) return;
 
