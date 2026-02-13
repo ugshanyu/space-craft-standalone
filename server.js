@@ -59,7 +59,7 @@ class RoomRuntime {
     this.finished = false;
     this.tickInterval = null;
     this.state = null;
-    this.lastState = null;
+    this.prevProjIds = new Set();
     this.serverTick = 0;
     this.ackSeqByPlayer = {};
   }
@@ -69,7 +69,7 @@ class RoomRuntime {
     const allPlayerIds = [...this.connectedUserIds];
     this.playerIds = allPlayerIds;
     this.state = Game.initState(allPlayerIds, hashRoomId(this.roomId));
-    this.lastState = structuredClone(this.state);
+    this.prevProjIds = new Set();
     for (const pid of allPlayerIds) this.ackSeqByPlayer[pid] = 0;
     this.running = true;
     this.tickInterval = setInterval(() => this.tick(), TICK_MS);
@@ -150,7 +150,6 @@ class RoomRuntime {
     const lastSeq = this.ackSeqByPlayer[userId] || 0;
     if (seq <= lastSeq) return { accepted: false, reason: 'NON_MONOTONIC_SEQ', expectedGt: lastSeq };
     this.inputQueue.push({ userId, seq, inputType, payload, clientTs });
-    this.inputQueue.sort((a, b) => a.seq - b.seq || a.userId.localeCompare(b.userId));
     return { accepted: true, queued: this.inputQueue.length };
   }
 
@@ -162,37 +161,48 @@ class RoomRuntime {
       Game.applyInput(this.state, event.userId, event.payload);
       this.ackSeqByPlayer[event.userId] = Math.max(this.ackSeqByPlayer[event.userId] || 0, event.seq);
     }
-    this.inputQueue = [];
+    this.inputQueue.length = 0;
 
-    const prev = this.lastState;
     Game.tick(this.state, TICK_MS);
 
-    const delta = Game.buildDelta(prev, this.state);
-    this.lastState = structuredClone(this.state);
+    // Track removed projectiles without cloning entire state
+    const currProjIds = new Set(this.state.projectiles.map(p => p.id));
+    const removedProjs = [];
+    for (const id of this.prevProjIds) {
+      if (!currProjIds.has(id)) removedProjs.push(id);
+    }
+    this.prevProjIds = currProjIds;
 
-    const deltaPayload = {
-      room_id: this.roomId,
-      protocol_version: '2',
-      server_ts: Date.now(),
-      server_tick: this.serverTick,
-      ack_seq_by_player: this.ackSeqByPlayer,
-      state_hash: hashState(this.state),
-      ...delta,
-    };
+    const isSnapshot = this.serverTick % SNAPSHOT_INTERVAL_TICKS === 0;
 
-    this.broadcast('state_delta', deltaPayload);
-
-    if (this.serverTick % SNAPSHOT_INTERVAL_TICKS === 0) {
-      const snapshot = {
+    if (isSnapshot) {
+      // Full snapshot only (no delta on the same tick)
+      this.broadcast('state_snapshot', {
         room_id: this.roomId,
         protocol_version: '2',
         server_ts: Date.now(),
         server_tick: this.serverTick,
         ack_seq_by_player: this.ackSeqByPlayer,
-        state_hash: hashState(this.state),
-        full_state: structuredClone(this.state),
-      };
-      this.broadcast('state_snapshot', snapshot);
+        full_state: fastCloneState(this.state),
+      });
+    } else {
+      // Lightweight delta – references state objects directly (no clone needed,
+      // they are freshly produced by Game.tick and won't be mutated until next tick).
+      this.broadcast('state_delta', {
+        room_id: this.roomId,
+        protocol_version: '2',
+        server_ts: Date.now(),
+        server_tick: this.serverTick,
+        ack_seq_by_player: this.ackSeqByPlayer,
+        changed_entities: {
+          phase: this.state.phase,
+          remainingMs: this.state.remainingMs,
+          players: this.state.players,
+          projectiles: this.state.projectiles,
+          pickups: this.state.pickups,
+        },
+        removed_entities: { projectiles: removedProjs },
+      });
     }
 
     const result = Game.isTerminal(this.state);
@@ -254,8 +264,20 @@ function hashRoomId(roomId) {
   return parseInt(crypto.createHash('sha256').update(roomId).digest('hex').slice(0, 12), 16);
 }
 
-function hashState(state) {
-  return crypto.createHash('sha256').update(JSON.stringify(state)).digest('hex').slice(0, 16);
+/** Lightweight clone of game state – avoids expensive structuredClone. */
+function fastCloneState(state) {
+  const players = {};
+  for (const [pid, p] of Object.entries(state.players)) {
+    players[pid] = { ...p, stats: { ...p.stats } };
+  }
+  return {
+    ...state,
+    arena: { ...state.arena },
+    players,
+    projectiles: state.projectiles.map(p => ({ ...p })),
+    pickups: state.pickups.map(p => ({ ...p })),
+    winnerIds: [...state.winnerIds],
+  };
 }
 
 async function fetchRoomInfo(roomId) {

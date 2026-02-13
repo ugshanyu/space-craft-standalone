@@ -111,10 +111,6 @@ export function tick(state, dtMs) {
     p.x = ((p.x + p.vx * dt) % W + W) % W;
     p.y = ((p.y + p.vy * dt) % H + H) % H;
 
-    // DEBUG: log position every 60 ticks (~3s)
-    if (state.tick % 60 === 0) {
-      console.log(`[POS] tick=${state.tick} pid=${pid.slice(0,8)} x=${p.x.toFixed(1)} y=${p.y.toFixed(1)} vx=${p.vx.toFixed(2)} vy=${p.vy.toFixed(2)} speed=${newSpeed.toFixed(2)}`)
-    }
     p.fireCooldownMs = Math.max(0, p.fireCooldownMs - dtMs);
     p.shield = Math.min(CONFIG.maxShield, _round(p.shield + CONFIG.shieldRegenPerTick));
 

@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 
 type AnyObj = Record<string, any>;
-type InputEvent = { seq: number; input_type: string; payload: AnyObj; client_ts: number };
+type InputEvent = { seq: number; payload: AnyObj; client_ts: number };
 
 declare global {
   interface Window {
@@ -11,227 +11,287 @@ declare global {
   }
 }
 
+/* ───── constants ───── */
 const CANVAS_SIZE = 1100;
-const INPUT_INTERVAL_MS = 50;
+const INPUT_SEND_MS = 33; // ~30 Hz input send rate
 const JOIN_RETRY_LIMIT = Number(process.env.NEXT_PUBLIC_JOIN_RETRY_LIMIT || 4);
 const JOIN_RETRY_BACKOFF_MS = 700;
-const UI_TICK_UPDATE_EVERY = 4;
+const UI_REFRESH_MS = 250; // React UI refresh rate (~4 Hz)
 
-function isFireKey(event: KeyboardEvent): boolean {
-  return event.code === "KeyE" || event.key.toLowerCase() === "e";
+// Physics – MUST match server/game.js
+const TURN_RATE = 4.2;
+const BASE_SPEED = 8;
+const MAX_SPEED = 28;
+const EASE_FACTOR = 0.15;
+const SERVER_DT = 0.05; // 50 ms server tick
+
+/* ───── helpers ───── */
+
+function isFireKey(e: KeyboardEvent) {
+  return e.code === "KeyE" || e.key.toLowerCase() === "e";
 }
 
-function isControlKey(event: KeyboardEvent): boolean {
-  const k = event.key.toLowerCase();
-  return (
-    k === "w" ||
-    k === "a" ||
-    k === "s" ||
-    k === "d" ||
-    event.key.startsWith("Arrow") ||
-    isFireKey(event)
-  );
+function isControlKey(e: KeyboardEvent) {
+  const k = e.key.toLowerCase();
+  return k === "w" || k === "a" || k === "s" || k === "d" || e.key.startsWith("Arrow") || isFireKey(e);
 }
+
+/** Frame-rate-independent ease that matches the 20 Hz server physics. */
+function ease(dt: number) {
+  return 1 - Math.pow(1 - EASE_FACTOR, dt / SERVER_DT);
+}
+
+/** Fast shallow clone of game state — much cheaper than structuredClone. */
+function cloneState(s: AnyObj): AnyObj {
+  const players: AnyObj = {};
+  for (const pid of Object.keys(s.players)) {
+    const p = s.players[pid];
+    players[pid] = { ...p, stats: { ...p.stats } };
+  }
+  return {
+    ...s,
+    players,
+    projectiles: s.projectiles.map((p: AnyObj) => ({ ...p })),
+    pickups: s.pickups.map((p: AnyObj) => ({ ...p })),
+  };
+}
+
+/** Advance one player by dt seconds using the given turn/thrust. */
+function simPlayer(me: AnyObj, turn: number, thrust: number, dt: number) {
+  me.angle += turn * TURN_RATE * dt;
+  const target = BASE_SPEED + thrust * (MAX_SPEED - BASE_SPEED);
+  const cur = Math.hypot(me.vx || 0, me.vy || 0) || 0.01;
+  const speed = cur + (target - cur) * ease(dt);
+  me.vx = Math.cos(me.angle) * speed;
+  me.vy = Math.sin(me.angle) * speed;
+  me.x = ((me.x + me.vx * dt) % 100 + 100) % 100;
+  me.y = ((me.y + me.vy * dt) % 100 + 100) % 100;
+}
+
+/* ═══════════════════════════════════════════════════════ */
 
 export default function Page() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  /* ── React state (UI shell, updated at low Hz) ── */
   const [status, setStatus] = useState("Initializing...");
-  const [roomId, setRoomId] = useState<string>("");
-  const [myId, setMyId] = useState<string>("");
+  const [roomId, setRoomId] = useState("");
+  const [displayId, setDisplayId] = useState("");
   const [joined, setJoined] = useState(false);
   const [serverTick, setServerTick] = useState(0);
   const [playerCount, setPlayerCount] = useState(0);
   const [waitingFor, setWaitingFor] = useState(0);
   const [gameStarted, setGameStarted] = useState(false);
   const [joining, setJoining] = useState(false);
-  const worldRef = useRef<AnyObj | null>(null);
-  const predictedRef = useRef<AnyObj | null>(null);
-  const pendingInputsRef = useRef<InputEvent[]>([]);
-  const keyStateRef = useRef({ up: false, down: false, left: false, right: false, fire: false });
+  const [uiPlayers, setUiPlayers] = useState<[string, AnyObj][]>([]);
+
+  /* ── Refs (hot game-loop path, full frequency) ── */
+  const worldRef = useRef<AnyObj | null>(null); // authoritative server state
+  const renderRef = useRef<AnyObj | null>(null); // continuously simulated draw state
+  const pendingRef = useRef<InputEvent[]>([]);
+  const keysRef = useRef({ up: false, down: false, left: false, right: false, fire: false });
   const seqRef = useRef(0);
   const lastAckRef = useRef(0);
   const inputTimerRef = useRef<number | null>(null);
-  const isConnectingRef = useRef(false);
-  const handlersBoundRef = useRef(false);
-  const activeRoomIdRef = useRef<string>("");
-  const myUserIdRef = useRef<string>("");
-  const animationFrameRef = useRef<number | null>(null);
-  const lastUiTickRef = useRef(0);
-  const lastServerTimeRef = useRef(Date.now());
-  const lastInputTimeRef = useRef(Date.now());
+  const uiTimerRef = useRef<number | null>(null);
+  const connectingRef = useRef(false);
+  const boundRef = useRef(false);
+  const roomIdRef = useRef("");
+  const myIdRef = useRef("");
+  const animRef = useRef<number | null>(null);
+  const startedRef = useRef(false);
+  const joinedRef = useRef(false);
+  const lastServerMs = useRef(performance.now());
+  const lastFrameMs = useRef(performance.now());
+  const serverTickRef = useRef(0);
 
-  const world = predictedRef.current || worldRef.current;
-  const players = Object.entries(world?.players || {}) as Array<[string, AnyObj]>;
-
+  /* ── SDK init ── */
   useEffect(() => {
-    if (window.Usion?._initialized) {
-      return;
-    }
-    if (window.Usion) {
-      window.Usion.init();
-    }
+    if (window.Usion?._initialized) return;
+    window.Usion?.init?.();
   }, []);
 
+  /* ── Keyboard ── */
   useEffect(() => {
-    const resetKeys = () => {
-      keyStateRef.current = { up: false, down: false, left: false, right: false, fire: false };
+    const reset = () => {
+      keysRef.current = { up: false, down: false, left: false, right: false, fire: false };
     };
-
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (isControlKey(event)) event.preventDefault();
-      const key = event.key.toLowerCase();
-      if (event.key === "ArrowUp" || key === "w") keyStateRef.current.up = true;
-      if (event.key === "ArrowDown" || key === "s") keyStateRef.current.down = true;
-      if (event.key === "ArrowLeft" || key === "a") keyStateRef.current.left = true;
-      if (event.key === "ArrowRight" || key === "d") keyStateRef.current.right = true;
-      if (isFireKey(event)) keyStateRef.current.fire = true;
+    const down = (e: KeyboardEvent) => {
+      if (isControlKey(e)) e.preventDefault();
+      const k = e.key.toLowerCase();
+      if (e.key === "ArrowUp" || k === "w") keysRef.current.up = true;
+      if (e.key === "ArrowDown" || k === "s") keysRef.current.down = true;
+      if (e.key === "ArrowLeft" || k === "a") keysRef.current.left = true;
+      if (e.key === "ArrowRight" || k === "d") keysRef.current.right = true;
+      if (isFireKey(e)) keysRef.current.fire = true;
     };
-
-    const onKeyUp = (event: KeyboardEvent) => {
-      if (isControlKey(event)) event.preventDefault();
-      const key = event.key.toLowerCase();
-      if (event.key === "ArrowUp" || key === "w") keyStateRef.current.up = false;
-      if (event.key === "ArrowDown" || key === "s") keyStateRef.current.down = false;
-      if (event.key === "ArrowLeft" || key === "a") keyStateRef.current.left = false;
-      if (event.key === "ArrowRight" || key === "d") keyStateRef.current.right = false;
-      if (isFireKey(event)) keyStateRef.current.fire = false;
+    const up = (e: KeyboardEvent) => {
+      if (isControlKey(e)) e.preventDefault();
+      const k = e.key.toLowerCase();
+      if (e.key === "ArrowUp" || k === "w") keysRef.current.up = false;
+      if (e.key === "ArrowDown" || k === "s") keysRef.current.down = false;
+      if (e.key === "ArrowLeft" || k === "a") keysRef.current.left = false;
+      if (e.key === "ArrowRight" || k === "d") keysRef.current.right = false;
+      if (isFireKey(e)) keysRef.current.fire = false;
     };
+    const focus = () => window.focus();
 
-    const focusWindow = () => window.focus();
-
-    window.addEventListener("keydown", onKeyDown);
-    window.addEventListener("keyup", onKeyUp);
-    window.addEventListener("blur", resetKeys);
-    window.addEventListener("pointerdown", focusWindow);
-
+    window.addEventListener("keydown", down);
+    window.addEventListener("keyup", up);
+    window.addEventListener("blur", reset);
+    window.addEventListener("pointerdown", focus);
     return () => {
-      window.removeEventListener("keydown", onKeyDown);
-      window.removeEventListener("keyup", onKeyUp);
-      window.removeEventListener("blur", resetKeys);
-      window.removeEventListener("pointerdown", focusWindow);
+      window.removeEventListener("keydown", down);
+      window.removeEventListener("keyup", up);
+      window.removeEventListener("blur", reset);
+      window.removeEventListener("pointerdown", focus);
     };
   }, []);
 
+  /* ══════════ 60 fps render loop ══════════
+   * Local player is advanced every frame using current key state.
+   * Remote players + projectiles are extrapolated from last server snapshot.
+   */
   useEffect(() => {
+    lastFrameMs.current = performance.now();
+
     const render = () => {
-      const now = Date.now();
-      const dtLocal = (now - lastInputTimeRef.current) / 1000;
-      const dtRemote = (now - lastServerTimeRef.current) / 1000;
-      drawWorld(predictedRef.current || worldRef.current, canvasRef.current, myId, dtLocal, dtRemote);
-      animationFrameRef.current = window.requestAnimationFrame(render);
-    };
-    animationFrameRef.current = window.requestAnimationFrame(render);
-    return () => {
-      if (animationFrameRef.current !== null) {
-        window.cancelAnimationFrame(animationFrameRef.current);
-        animationFrameRef.current = null;
-      }
-    };
-  }, [myId]);
+      const now = performance.now();
+      const dt = Math.min((now - lastFrameMs.current) / 1000, 0.1);
+      lastFrameMs.current = now;
 
+      // Advance local player at render framerate — zero-delay movement
+      const state = renderRef.current;
+      if (state && startedRef.current && myIdRef.current) {
+        const me = state.players?.[myIdRef.current];
+        if (me?.alive) {
+          const k = keysRef.current;
+          simPlayer(
+            me,
+            k.left ? -1 : k.right ? 1 : 0,
+            k.up ? 1 : k.down ? -0.4 : 0,
+            dt,
+          );
+        }
+      }
+
+      const dtRemote = Math.min((now - lastServerMs.current) / 1000, 0.15);
+      drawWorld(state, canvasRef.current, myIdRef.current, dtRemote);
+      animRef.current = requestAnimationFrame(render);
+    };
+
+    animRef.current = requestAnimationFrame(render);
+    return () => {
+      if (animRef.current !== null) cancelAnimationFrame(animRef.current);
+    };
+  }, []);
+
+  /* ══════════ Input send interval (~30 Hz) ══════════ */
   useEffect(() => {
     const usion = window.Usion;
     if (!usion?.game) return;
 
     if (gameStarted && joined && !inputTimerRef.current) {
       inputTimerRef.current = window.setInterval(() => {
-        const input = buildInputFromKeys();
-        pendingInputsRef.current.push(input);
-        applyLocalPrediction(input);
-        lastInputTimeRef.current = Date.now();
+        if (!startedRef.current) return;
+        const k = keysRef.current;
+        seqRef.current++;
+        const input: InputEvent = {
+          seq: seqRef.current,
+          client_ts: Date.now(),
+          payload: {
+            turn: k.left ? -1 : k.right ? 1 : 0,
+            thrust: k.up ? 1 : k.down ? -0.4 : 0,
+            fire: k.fire,
+          },
+        };
+        pendingRef.current.push(input);
         usion.game.realtime("control", input.payload);
-      }, INPUT_INTERVAL_MS);
+      }, INPUT_SEND_MS);
     }
 
     if (!gameStarted && inputTimerRef.current) {
-      window.clearInterval(inputTimerRef.current);
+      clearInterval(inputTimerRef.current);
       inputTimerRef.current = null;
     }
-  }, [gameStarted, joined, myId]);
+  }, [gameStarted, joined]);
+
+  /* ══════════ Low-frequency UI refresh ══════════ */
+  useEffect(() => {
+    if (gameStarted && !uiTimerRef.current) {
+      uiTimerRef.current = window.setInterval(() => {
+        setServerTick(serverTickRef.current);
+        const s = renderRef.current || worldRef.current;
+        if (s?.players) {
+          setUiPlayers(Object.entries(s.players) as [string, AnyObj][]);
+        }
+      }, UI_REFRESH_MS);
+    }
+    if (!gameStarted && uiTimerRef.current) {
+      clearInterval(uiTimerRef.current);
+      uiTimerRef.current = null;
+    }
+    return () => {
+      if (uiTimerRef.current) {
+        clearInterval(uiTimerRef.current);
+        uiTimerRef.current = null;
+      }
+    };
+  }, [gameStarted]);
+
+  /* ══════════ Server reconciliation ══════════ */
+  function reconcile(data: AnyObj) {
+    const full = data.full_state;
+    if (full) {
+      worldRef.current = full;
+    } else if (worldRef.current && data.changed_entities) {
+      const w = worldRef.current;
+      const ce = data.changed_entities;
+      worldRef.current = {
+        ...w,
+        ...ce,
+        players: ce.players || w.players,
+        projectiles: ce.projectiles || w.projectiles,
+        pickups: ce.pickups || w.pickups,
+      };
+    }
+    if (!worldRef.current) return;
+
+    const id = myIdRef.current;
+    const ack = Number(data.ack_seq_by_player?.[id] || 0);
+    lastAckRef.current = Math.max(lastAckRef.current, ack);
+    pendingRef.current = pendingRef.current.filter((e) => e.seq > lastAckRef.current);
+
+    // Rebuild render state from authoritative + replay pending inputs
+    const rs = cloneState(worldRef.current);
+    for (const ev of pendingRef.current) {
+      const me = rs.players?.[id];
+      if (me?.alive) {
+        simPlayer(me, Number(ev.payload.turn || 0), Number(ev.payload.thrust || 0), SERVER_DT);
+      }
+    }
+    renderRef.current = rs;
+    lastServerMs.current = performance.now();
+  }
+
+  /* ──────── connect & join ──────── */
 
   function getConfigRoomId(): string {
     const params = new URLSearchParams(window.location.search);
-    const queryRoomId = params.get("roomId");
-    if (queryRoomId) return queryRoomId;
-    const cfg = window.Usion?.config;
-    return cfg?.roomId || "";
+    return params.get("roomId") || window.Usion?.config?.roomId || "";
   }
 
-  function buildInputFromKeys(): InputEvent {
-    const keys = keyStateRef.current;
-    const turn = keys.left ? -1 : keys.right ? 1 : 0;
-    const thrust = keys.up ? 1 : keys.down ? -0.4 : 0;
-    seqRef.current += 1;
-    return {
-      seq: seqRef.current,
-      input_type: "control",
-      client_ts: Date.now(),
-      payload: { turn, thrust, fire: keys.fire },
-    };
-  }
-
-  function applyLocalPrediction(input: InputEvent): void {
-    const state = predictedRef.current || worldRef.current;
-    if (!state || !myId) return;
-    const me = state.players?.[myId];
-    if (!me || !me.alive) return;
-    const dt = INPUT_INTERVAL_MS / 1000;
-    const turn = Number(input.payload.turn || 0);
-    const thrust = Number(input.payload.thrust || 0);
-
-    me.angle = Number(me.angle || 0) + turn * 4.2 * dt;
-
-    const baseSpeed = 8;
-    const maxSpeed = 28;
-    const targetSpeed = baseSpeed + thrust * (maxSpeed - baseSpeed);
-    const curSpeed = Math.hypot(Number(me.vx || 0), Number(me.vy || 0)) || 0.01;
-    const newSpeed = curSpeed + (targetSpeed - curSpeed) * 0.15;
-
-    me.vx = Math.cos(me.angle) * newSpeed;
-    me.vy = Math.sin(me.angle) * newSpeed;
-
-    me.x = ((Number(me.x || 0) + me.vx * dt) % 100 + 100) % 100;
-    me.y = ((Number(me.y || 0) + me.vy * dt) % 100 + 100) % 100;
-  }
-
-  function reconcileFromServer(snapshotOrDelta: AnyObj): void {
-    const fullState = snapshotOrDelta.full_state;
-    if (fullState) {
-      worldRef.current = fullState;
-    } else if (worldRef.current && snapshotOrDelta.changed_entities) {
-      worldRef.current = {
-        ...worldRef.current,
-        ...snapshotOrDelta.changed_entities,
-        players: snapshotOrDelta.changed_entities.players || worldRef.current.players,
-        projectiles: snapshotOrDelta.changed_entities.projectiles || worldRef.current.projectiles,
-        pickups: snapshotOrDelta.changed_entities.pickups || worldRef.current.pickups,
-      };
-    }
-
-    if (!worldRef.current) return;
-
-    const ack = Number(snapshotOrDelta.ack_seq_by_player?.[myId] || 0);
-    lastAckRef.current = Math.max(lastAckRef.current, ack);
-    pendingInputsRef.current = pendingInputsRef.current.filter((ev) => ev.seq > lastAckRef.current);
-    predictedRef.current = structuredClone(worldRef.current);
-    for (const ev of pendingInputsRef.current) applyLocalPrediction(ev);
-    lastServerTimeRef.current = Date.now();
-    lastInputTimeRef.current = Date.now();
-  }
-
-  async function sleep(ms: number): Promise<void> {
-    await new Promise((resolve) => window.setTimeout(resolve, ms));
+  async function sleep(ms: number) {
+    await new Promise((r) => setTimeout(r, ms));
   }
 
   async function connectAndJoin() {
-    if (isConnectingRef.current) return;
-
+    if (connectingRef.current) return;
     const usion = window.Usion;
     if (!usion?.game) {
       setStatus("SDK not ready");
       return;
     }
-
     const rid = getConfigRoomId();
     if (!rid) {
       setStatus("Missing roomId");
@@ -239,94 +299,96 @@ export default function Page() {
     }
 
     setRoomId(rid);
-    activeRoomIdRef.current = rid;
+    roomIdRef.current = rid;
     const uid = String(usion.user?.getId?.() || "");
-    myUserIdRef.current = uid;
-    setMyId(uid);
+    myIdRef.current = uid;
+    setDisplayId(uid);
     setStatus("Connecting to direct server...");
-    isConnectingRef.current = true;
+    connectingRef.current = true;
     setJoining(true);
 
     try {
-      if (!handlersBoundRef.current) {
-        handlersBoundRef.current = true;
+      if (!boundRef.current) {
+        boundRef.current = true;
 
-        usion.game.onJoined((data: AnyObj) => {
-          if (data?.room_id && data.room_id !== activeRoomIdRef.current) return;
-          const pids = Array.from(new Set((data.player_ids || []).map(String)));
-          const waiting = Number(data.waiting_for || 0);
+        usion.game.onJoined((d: AnyObj) => {
+          if (d?.room_id && d.room_id !== roomIdRef.current) return;
+          const pids = Array.from(new Set((d.player_ids || []).map(String)));
+          const w = Number(d.waiting_for || 0);
           setJoined(true);
+          joinedRef.current = true;
           setPlayerCount(pids.length);
-          setWaitingFor(waiting);
-          if (waiting > 0) {
-            setStatus(`Waiting for ${waiting} more player(s)... (${pids.length}/2)`);
-          } else {
-            setStatus("All players connected!");
-          }
+          setWaitingFor(w);
+          setStatus(
+            w > 0
+              ? `Waiting for ${w} more player(s)... (${pids.length}/2)`
+              : "All players connected!",
+          );
         });
 
-        if (usion.game.onPlayerJoined) {
-          usion.game.onPlayerJoined((data: AnyObj) => {
-            if (data?.room_id && data.room_id !== activeRoomIdRef.current) return;
-            const pids = Array.from(new Set((data.player_ids || []).map(String)));
-            const joinedPlayerId = String(data.player_id || "");
-            if (joinedPlayerId && joinedPlayerId === myUserIdRef.current && pids.length <= 1) {
-              return;
-            }
-            const waiting = data.waiting_for !== undefined
-              ? Number(data.waiting_for || 0)
+        usion.game.onPlayerJoined?.((d: AnyObj) => {
+          if (d?.room_id && d.room_id !== roomIdRef.current) return;
+          const pids = Array.from(new Set((d.player_ids || []).map(String)));
+          const jp = String(d.player_id || "");
+          if (jp && jp === myIdRef.current && pids.length <= 1) return;
+          const w =
+            d.waiting_for !== undefined
+              ? Number(d.waiting_for || 0)
               : Math.max(0, 2 - pids.length);
-            setPlayerCount(pids.length);
-            setWaitingFor(waiting);
-            if (waiting > 0) {
-              setStatus(`Player joined! Waiting for ${waiting} more... (${pids.length}/2)`);
-            } else {
-              setStatus("All players connected! Starting...");
-            }
-          });
-        }
+          setPlayerCount(pids.length);
+          setWaitingFor(w);
+          setStatus(
+            w > 0
+              ? `Player joined! Waiting for ${w} more... (${pids.length}/2)`
+              : "All players connected! Starting...",
+          );
+        });
 
-        usion.game.onGameStart((data: AnyObj) => {
-          if (data?.room_id && data.room_id !== activeRoomIdRef.current) return;
+        usion.game.onGameStart((d: AnyObj) => {
+          if (d?.room_id && d.room_id !== roomIdRef.current) return;
           setGameStarted(true);
-          setPlayerCount((data.player_ids || []).length);
+          startedRef.current = true;
+          setPlayerCount((d.player_ids || []).length);
           setWaitingFor(0);
           setStatus("Game started! Fight!");
         });
 
-        usion.game.onRealtime((data: AnyObj) => {
-          if (data.room_id !== activeRoomIdRef.current) return;
-          if (data.protocol_version === "2") {
-            setGameStarted(true);
-            const tick = Number(data.server_tick || 0);
-            if (tick - lastUiTickRef.current >= UI_TICK_UPDATE_EVERY || tick < lastUiTickRef.current) {
-              lastUiTickRef.current = tick;
-              setServerTick(tick);
+        usion.game.onRealtime((d: AnyObj) => {
+          if (d.room_id !== roomIdRef.current) return;
+          if (d.protocol_version === "2") {
+            if (!startedRef.current) {
+              setGameStarted(true);
+              startedRef.current = true;
             }
-            reconcileFromServer(data);
+            serverTickRef.current = Number(d.server_tick || 0);
+            reconcile(d);
           }
         });
 
-        usion.game.onStateUpdate((data: AnyObj) => {
-          if (data.room_id !== activeRoomIdRef.current) return;
-          setGameStarted(true);
-          const tick = Number(data.server_tick || 0);
-          if (tick - lastUiTickRef.current >= UI_TICK_UPDATE_EVERY || tick < lastUiTickRef.current) {
-            lastUiTickRef.current = tick;
-            setServerTick(tick);
+        usion.game.onStateUpdate((d: AnyObj) => {
+          if (d.room_id !== roomIdRef.current) return;
+          if (!startedRef.current) {
+            setGameStarted(true);
+            startedRef.current = true;
           }
-          reconcileFromServer(data);
+          serverTickRef.current = Number(d.server_tick || 0);
+          reconcile(d);
         });
 
-        usion.game.onGameFinished((data: AnyObj) => {
-          if (data.room_id !== activeRoomIdRef.current) return;
+        usion.game.onGameFinished((d: AnyObj) => {
+          if (d.room_id !== roomIdRef.current) return;
           setGameStarted(false);
-          setStatus(`Match ended (${data.reason || "completed"})`);
+          startedRef.current = false;
+          setStatus(`Match ended (${d.reason || "completed"})`);
         });
 
-        usion.game.onError((data: AnyObj) => {
-          if (data.room_id && data.room_id !== activeRoomIdRef.current) return;
-          const details = [data.code || "unknown", data.reason, data.expectedGt ? `expected>${data.expectedGt}` : ""]
+        usion.game.onError((d: AnyObj) => {
+          if (d.room_id && d.room_id !== roomIdRef.current) return;
+          const details = [
+            d.code || "unknown",
+            d.reason,
+            d.expectedGt ? `expected>${d.expectedGt}` : "",
+          ]
             .filter(Boolean)
             .join(" | ");
           setStatus(`Server error: ${details}`);
@@ -342,52 +404,60 @@ export default function Page() {
           await sleep(120);
           await usion.game.connectDirect();
           setStatus("Connected, joining room...");
-          const joinResp = await usion.game.join(rid);
-          if (joinResp?.error) throw new Error(joinResp.error);
+          const jr = await usion.game.join(rid);
+          if (jr?.error) throw new Error(jr.error);
 
           setJoined(true);
-          const pids = joinResp?.player_ids || [];
-          const waiting = Number(joinResp?.waiting_for || 0);
+          joinedRef.current = true;
+          const pids = jr?.player_ids || [];
+          const w = Number(jr?.waiting_for || 0);
           setPlayerCount(pids.length);
-          setWaitingFor(waiting);
-          if (waiting > 0) {
-            setStatus(`Waiting for ${waiting} more player(s)... (${pids.length}/2)`);
-          } else {
-            setStatus("All players connected!");
-          }
+          setWaitingFor(w);
+          setStatus(
+            w > 0
+              ? `Waiting for ${w} more player(s)... (${pids.length}/2)`
+              : "All players connected!",
+          );
           lastErr = null;
           break;
         } catch (err: any) {
           lastErr = err;
-          const msg = String(err?.message || err);
           try {
             usion.game.disconnect?.();
           } catch {}
-          if (!msg.includes("code=1006") || attempt === JOIN_RETRY_LIMIT) {
+          if (
+            !String(err?.message || err).includes("code=1006") ||
+            attempt === JOIN_RETRY_LIMIT
+          ) {
             throw err;
           }
           setStatus(`Reconnecting... (${attempt}/${JOIN_RETRY_LIMIT})`);
           await sleep(JOIN_RETRY_BACKOFF_MS * attempt);
         }
       }
-
       if (lastErr) throw lastErr;
     } catch (err: any) {
       setStatus(`Connection failed: ${err.message || String(err)}`);
     } finally {
-      isConnectingRef.current = false;
+      connectingRef.current = false;
       setJoining(false);
     }
   }
 
+  /* ── Cleanup ── */
   useEffect(() => {
     return () => {
-      if (inputTimerRef.current) window.clearInterval(inputTimerRef.current);
+      if (inputTimerRef.current) clearInterval(inputTimerRef.current);
+      if (uiTimerRef.current) clearInterval(uiTimerRef.current);
       try {
         window.Usion?.game?.disconnect?.();
       } catch {}
     };
   }, []);
+
+  /* ═══════════ JSX ═══════════ */
+  const players = uiPlayers;
+  const myIdDisplay = displayId;
 
   return (
     <main
@@ -409,7 +479,8 @@ export default function Page() {
           display: "grid",
           gridTemplateRows: "auto auto auto auto minmax(0, 1fr) auto",
           gap: 10,
-          background: "linear-gradient(180deg, rgba(15,23,42,0.95), rgba(2,6,23,0.96))",
+          background:
+            "linear-gradient(180deg, rgba(15,23,42,0.95), rgba(2,6,23,0.96))",
           border: "1px solid rgba(71,85,105,0.5)",
           borderRadius: 16,
           padding: 14,
@@ -417,11 +488,27 @@ export default function Page() {
           boxSizing: "border-box",
         }}
       >
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 12 }}>
-          <h1 style={{ margin: 0, color: "#f8fafc", fontWeight: 800, fontSize: "clamp(1.4rem, 2.5vw, 2rem)" }}>
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "baseline",
+            gap: 12,
+          }}
+        >
+          <h1
+            style={{
+              margin: 0,
+              color: "#f8fafc",
+              fontWeight: 800,
+              fontSize: "clamp(1.4rem, 2.5vw, 2rem)",
+            }}
+          >
             Space Craft Arena
           </h1>
-          <div style={{ color: "#93c5fd", fontSize: 12, fontWeight: 600 }}>Tick {serverTick}</div>
+          <div style={{ color: "#93c5fd", fontSize: 12, fontWeight: 600 }}>
+            Tick {serverTick}
+          </div>
         </div>
 
         <div style={{ color: "#93c5fd", fontSize: 13 }}>
@@ -435,7 +522,9 @@ export default function Page() {
             gap: 10,
             borderRadius: 10,
             border: "1px solid rgba(71,85,105,0.6)",
-            background: gameStarted ? "rgba(6,95,70,0.35)" : "rgba(30,41,59,0.7)",
+            background: gameStarted
+              ? "rgba(6,95,70,0.35)"
+              : "rgba(30,41,59,0.7)",
             color: "#e2e8f0",
             fontSize: 13,
             fontWeight: 600,
@@ -447,7 +536,11 @@ export default function Page() {
               width: 9,
               height: 9,
               borderRadius: "50%",
-              background: gameStarted ? "#34d399" : waitingFor > 0 ? "#fbbf24" : "#34d399",
+              background: gameStarted
+                ? "#34d399"
+                : waitingFor > 0
+                  ? "#fbbf24"
+                  : "#34d399",
               boxShadow: "0 0 12px currentColor",
             }}
           />
@@ -488,7 +581,8 @@ export default function Page() {
             placeItems: "center",
             borderRadius: 14,
             border: "1px solid rgba(56, 189, 248, 0.25)",
-            background: "linear-gradient(180deg, rgba(2,6,23,0.96), rgba(3,7,18,0.96))",
+            background:
+              "linear-gradient(180deg, rgba(2,6,23,0.96), rgba(3,7,18,0.96))",
             overflow: "hidden",
             position: "relative",
           }}
@@ -525,7 +619,16 @@ export default function Page() {
           )}
         </div>
 
-        <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "center", fontSize: 12, color: "#93c5fd" }}>
+        <div
+          style={{
+            display: "flex",
+            gap: 14,
+            flexWrap: "wrap",
+            alignItems: "center",
+            fontSize: 12,
+            color: "#93c5fd",
+          }}
+        >
           <span>Move: W/A/D or Arrow keys</span>
           <span>Fire: E</span>
           <span>Weapon boosts: yellow crates (W+)</span>
@@ -536,11 +639,17 @@ export default function Page() {
                 padding: "4px 8px",
                 borderRadius: 999,
                 border: "1px solid rgba(71,85,105,0.7)",
-                background: pid === myId ? "rgba(6,182,212,0.16)" : "rgba(245,158,11,0.14)",
+                background:
+                  pid === myIdDisplay
+                    ? "rgba(6,182,212,0.16)"
+                    : "rgba(245,158,11,0.14)",
                 color: "#e2e8f0",
               }}
             >
-              {pid === myId ? "You" : "Enemy"} HP {Math.round(Number(p.hp || 0))} SH {Math.round(Number(p.shield || 0))} W{Math.max(1, Number(p.weaponLevel || 1))}
+              {pid === myIdDisplay ? "You" : "Enemy"} HP{" "}
+              {Math.round(Number(p.hp || 0))} SH{" "}
+              {Math.round(Number(p.shield || 0))} W
+              {Math.max(1, Number(p.weaponLevel || 1))}
             </span>
           ))}
         </div>
@@ -549,60 +658,61 @@ export default function Page() {
   );
 }
 
-function drawWorld(world: AnyObj | null, canvas: HTMLCanvasElement | null, myId: string, dtLocal: number = 0, dtRemote: number = 0): void {
+/* ═══════════════════════════════════════════════════
+ *  Canvas renderer
+ *  Local player position is already advanced every frame in the render loop,
+ *  so it's drawn as-is. Remote entities are extrapolated from last server
+ *  update using their velocity.
+ * ═══════════════════════════════════════════════════ */
+
+function drawWorld(
+  world: AnyObj | null,
+  canvas: HTMLCanvasElement | null,
+  myId: string,
+  dtRemote: number,
+): void {
   if (!world || !canvas) return;
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
 
-  const width = canvas.width;
-  const height = canvas.height;
-  const scaleX = width / 100;
-  const scaleY = height / 100;
+  const W = canvas.width;
+  const H = canvas.height;
+  const sx = W / 100;
+  const sy = H / 100;
+  const safeDt = Math.min(dtRemote, 0.15);
 
-  // Clamp dt to avoid huge jumps if tab was backgrounded
-  const maxDt = 0.2;
-  const safeDtLocal = Math.min(dtLocal, maxDt);
-  const safeDtRemote = Math.min(dtRemote, maxDt);
+  // Background — solid fill is cheaper than gradient at 60 fps
+  ctx.fillStyle = "#060e1f";
+  ctx.fillRect(0, 0, W, H);
 
-  const spaceGradient = ctx.createLinearGradient(0, 0, 0, height);
-  spaceGradient.addColorStop(0, "#08122a");
-  spaceGradient.addColorStop(1, "#030712");
-  ctx.fillStyle = spaceGradient;
-  ctx.fillRect(0, 0, width, height);
-
+  // Grid — batch into a single path
   ctx.strokeStyle = "rgba(56, 189, 248, 0.08)";
   ctx.lineWidth = 1;
+  ctx.beginPath();
   for (let i = 10; i < 100; i += 10) {
-    const gx = i * scaleX;
-    const gy = i * scaleY;
-    ctx.beginPath();
+    const gx = i * sx;
+    const gy = i * sy;
     ctx.moveTo(gx, 0);
-    ctx.lineTo(gx, height);
-    ctx.stroke();
-    ctx.beginPath();
+    ctx.lineTo(gx, H);
     ctx.moveTo(0, gy);
-    ctx.lineTo(width, gy);
-    ctx.stroke();
+    ctx.lineTo(W, gy);
   }
+  ctx.stroke();
 
-  const tick = Number(world.tick || 0);
+  // Stars — static pattern (no per-tick jitter)
+  ctx.fillStyle = "rgba(147, 197, 253, 0.35)";
   for (let i = 0; i < 28; i++) {
-    const x = ((i * 37) % 100) * scaleX + (((tick + i * 11) % 50) / 50) * 0.6;
-    const y = ((i * 53) % 100) * scaleY + (((tick + i * 7) % 50) / 50) * 0.6;
-    const alpha = 0.3 + ((tick + i * 13) % 10) * 0.03;
-    ctx.fillStyle = `rgba(147, 197, 253, ${alpha})`;
-    ctx.fillRect(x, y, 1.5, 1.5);
+    ctx.fillRect(((i * 37) % 100) * sx, ((i * 53) % 100) * sy, 1.5, 1.5);
   }
 
-  const pickups = world.pickups || [];
-  for (const pickup of pickups) {
-    const px = Number(pickup.x || 0) * scaleX;
-    const py = Number(pickup.y || 0) * scaleY;
+  // Pickups
+  for (const pickup of world.pickups || []) {
+    const px = Number(pickup.x || 0) * sx;
+    const py = Number(pickup.y || 0) * sy;
 
     ctx.save();
     ctx.translate(px, py);
     ctx.rotate(((world.tick || 0) * 0.04) % (Math.PI * 2));
-
     ctx.shadowBlur = 16;
     ctx.shadowColor = "rgba(250, 204, 21, 0.7)";
     ctx.fillStyle = "#facc15";
@@ -613,7 +723,6 @@ function drawWorld(world: AnyObj | null, canvas: HTMLCanvasElement | null, myId:
     ctx.lineTo(-9, 0);
     ctx.closePath();
     ctx.fill();
-
     ctx.shadowBlur = 0;
     ctx.fillStyle = "#1f2937";
     ctx.fillRect(-4, -1.8, 8, 3.6);
@@ -624,56 +733,62 @@ function drawWorld(world: AnyObj | null, canvas: HTMLCanvasElement | null, myId:
     ctx.fillText("W+", px - 9, py - 12);
   }
 
-  const projectiles = world.projectiles || [];
-  for (const proj of projectiles) {
-    let px = Number(proj.x || 0) + Number(proj.vx || 0) * safeDtRemote;
-    let py = Number(proj.y || 0) + Number(proj.vy || 0) * safeDtRemote;
-    
-    // Wrap
-    px = ((px % 100) + 100) % 100;
-    py = ((py % 100) + 100) % 100;
-
-    const x = px * scaleX;
-    const y = py * scaleY;
-
-    ctx.shadowBlur = 14;
-    ctx.shadowColor = "rgba(244, 63, 94, 0.9)";
-    ctx.fillStyle = "#fb7185";
+  // Projectiles — batch shadow state
+  ctx.shadowBlur = 14;
+  ctx.shadowColor = "rgba(244, 63, 94, 0.9)";
+  ctx.fillStyle = "#fb7185";
+  for (const proj of world.projectiles || []) {
+    let px =
+      (Number(proj.x || 0) + Number(proj.vx || 0) * safeDt) % 100;
+    let py =
+      (Number(proj.y || 0) + Number(proj.vy || 0) * safeDt) % 100;
+    if (px < 0) px += 100;
+    if (py < 0) py += 100;
     ctx.beginPath();
-    ctx.arc(x, y, 4, 0, Math.PI * 2);
+    ctx.arc(px * sx, py * sy, 4, 0, Math.PI * 2);
     ctx.fill();
-    ctx.shadowBlur = 0;
   }
+  ctx.shadowBlur = 0;
 
-  const players = world.players || {};
-  const entries = Object.entries(players) as Array<[string, AnyObj]>;
+  // Players
+  const entries = Object.entries(world.players || {}) as [string, AnyObj][];
   for (const [pid, player] of entries) {
     const isMe = pid === myId;
-    const dt = isMe ? safeDtLocal : safeDtRemote;
-    
-    let px = Number(player.x || 0) + Number(player.vx || 0) * dt;
-    let py = Number(player.y || 0) + Number(player.vy || 0) * dt;
-    
-    // Wrap
-    px = ((px % 100) + 100) % 100;
-    py = ((py % 100) + 100) % 100;
 
-    const x = px * scaleX;
-    const y = py * scaleY;
-    
-    const angle = Number(player.angle || 0); // Not extrapolating angle for simplicity
+    // Local player: position already advanced in render loop
+    // Remote player: extrapolate from last server snapshot
+    let px: number, py: number;
+    if (isMe) {
+      px = Number(player.x || 0);
+      py = Number(player.y || 0);
+    } else {
+      px =
+        ((Number(player.x || 0) + Number(player.vx || 0) * safeDt) % 100 +
+          100) %
+        100;
+      py =
+        ((Number(player.y || 0) + Number(player.vy || 0) * safeDt) % 100 +
+          100) %
+        100;
+    }
+
+    const x = px * sx;
+    const y = py * sy;
+    const angle = Number(player.angle || 0);
     const hp = Math.max(0, Number(player.hp || 0));
     const shield = Math.max(0, Number(player.shield || 0));
-    const weaponLevel = Math.max(1, Number(player.weaponLevel || 1));
+    const wl = Math.max(1, Number(player.weaponLevel || 1));
 
     ctx.save();
     ctx.translate(x, y);
     ctx.rotate(angle);
 
     if (player.alive) {
-      ctx.fillStyle = pid === myId ? "#22d3ee" : "#f59e0b";
+      ctx.fillStyle = isMe ? "#22d3ee" : "#f59e0b";
       ctx.shadowBlur = 18;
-      ctx.shadowColor = pid === myId ? "rgba(34,211,238,0.8)" : "rgba(245,158,11,0.8)";
+      ctx.shadowColor = isMe
+        ? "rgba(34,211,238,0.8)"
+        : "rgba(245,158,11,0.8)";
     } else {
       ctx.fillStyle = "#64748b";
       ctx.shadowBlur = 0;
@@ -687,8 +802,10 @@ function drawWorld(world: AnyObj | null, canvas: HTMLCanvasElement | null, myId:
     ctx.closePath();
     ctx.fill();
 
-    const velocity = Math.hypot(Number(player.vx || 0), Number(player.vy || 0));
-    if (player.alive && velocity > 10) {
+    if (
+      player.alive &&
+      Math.hypot(Number(player.vx || 0), Number(player.vy || 0)) > 10
+    ) {
       ctx.fillStyle = "rgba(125, 211, 252, 0.95)";
       ctx.beginPath();
       ctx.moveTo(-9, 0);
@@ -701,21 +818,23 @@ function drawWorld(world: AnyObj | null, canvas: HTMLCanvasElement | null, myId:
     ctx.shadowBlur = 0;
     ctx.restore();
 
+    // HP bar
     const barY = y - 18;
-    const hpWidth = 32;
+    const bw = 32;
     ctx.fillStyle = "rgba(15, 23, 42, 0.8)";
-    ctx.fillRect(x - hpWidth / 2, barY, hpWidth, 4);
+    ctx.fillRect(x - bw / 2, barY, bw, 4);
     ctx.fillStyle = "#22c55e";
-    ctx.fillRect(x - hpWidth / 2, barY, (hp / 100) * hpWidth, 4);
+    ctx.fillRect(x - bw / 2, barY, (hp / 100) * bw, 4);
 
+    // Shield bar
     ctx.fillStyle = "rgba(15, 23, 42, 0.8)";
-    ctx.fillRect(x - hpWidth / 2, barY + 5, hpWidth, 3);
+    ctx.fillRect(x - bw / 2, barY + 5, bw, 3);
     ctx.fillStyle = "#60a5fa";
-    ctx.fillRect(x - hpWidth / 2, barY + 5, (shield / 60) * hpWidth, 3);
+    ctx.fillRect(x - bw / 2, barY + 5, (shield / 60) * bw, 3);
 
+    // Label
     ctx.fillStyle = "#f8fafc";
     ctx.font = "bold 12px system-ui";
-    const label = pid === myId ? "YOU" : "RIVAL";
-    ctx.fillText(`${label} W${weaponLevel}`, x - 20, y - 26);
+    ctx.fillText(`${isMe ? "YOU" : "RIVAL"} W${wl}`, x - 20, y - 26);
   }
 }
