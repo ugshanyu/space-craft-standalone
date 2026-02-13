@@ -61,9 +61,10 @@ declare global {
 const CANVAS_SIZE = 1000;
 const JOIN_RETRY_LIMIT = Number(process.env.NEXT_PUBLIC_JOIN_RETRY_LIMIT || 4);
 const JOIN_RETRY_BACKOFF_MS = 600;
+const BRUTAL_CLIENT_SIDE_MODE = process.env.NEXT_PUBLIC_BRUTAL_CLIENT_SIDE_MODE !== "0";
 
 const INPUT_SEND_MS = 33;
-const INTERP_DELAY_MS = 45;
+const INTERP_DELAY_MS = BRUTAL_CLIENT_SIDE_MODE ? 20 : 45;
 const UI_TICK_UPDATE_EVERY = 2;
 const MAX_PENDING_INPUTS = 120;
 const IMMEDIATE_INPUT_MIN_GAP_MS = 12;
@@ -357,6 +358,19 @@ function applyLocalPrediction(state: WorldState, myId: string, input: InputPaylo
   return pred;
 }
 
+function blendServerAndLocalPlayer(serverPlayer: PlayerState | undefined, localPlayer: PlayerState): PlayerState {
+  if (!serverPlayer) return { ...localPlayer };
+  return {
+    ...serverPlayer,
+    x: localPlayer.x,
+    y: localPlayer.y,
+    vx: localPlayer.vx,
+    vy: localPlayer.vy,
+    angle: localPlayer.angle,
+    alive: localPlayer.alive,
+  };
+}
+
 function advanceProjectile(projectile: ProjectileState, dtSec: number, maxAgeMs: number): ProjectileState {
   return {
     ...projectile,
@@ -540,7 +554,7 @@ export default function Page() {
     lastInputSentAtRef.current = sentAtMs;
 
     const transportSeq = Number(usion?.game?._directSeq || 0);
-    if (transportSeq > 0) {
+    if (!BRUTAL_CLIENT_SIDE_MODE && transportSeq > 0) {
       pendingInputsRef.current.push({ transportSeq, payload: inputWithTiming, dtSec });
       if (pendingInputsRef.current.length > MAX_PENDING_INPUTS) {
         pendingInputsRef.current.splice(0, pendingInputsRef.current.length - MAX_PENDING_INPUTS);
@@ -759,7 +773,23 @@ export default function Page() {
 
       const newest = snapshots[snapshots.length - 1]?.state;
       const newestMe = newest?.players?.[myPid];
-      if (newestMe) {
+      if (BRUTAL_CLIENT_SIDE_MODE) {
+        const serverMe = newestMe || renderState.players[myPid] || undefined;
+        const seedMe = localVisualPlayerRef.current || serverMe;
+        if (seedMe) {
+          const nextLocal = (joinedRef.current && gameStartedRef.current)
+            ? applyInputToPlayer(seedMe, buildInputFromKeys(keysRef.current), frameDtSec)
+            : seedMe;
+          localVisualPlayerRef.current = { ...nextLocal };
+          renderState = {
+            ...renderState,
+            players: {
+              ...renderState.players,
+              [myPid]: blendServerAndLocalPlayer(serverMe, nextLocal),
+            },
+          };
+        }
+      } else if (newestMe) {
         const reconciled = reconcileLocalPlayerVisual(
           localVisualPlayerRef.current,
           newestMe,
@@ -778,13 +808,15 @@ export default function Page() {
           },
         };
       }
-      for (const pending of pendingInputsRef.current) {
-        renderState = applyLocalPrediction(renderState, myPid, pending.payload, pending.dtSec);
-      }
+      if (!BRUTAL_CLIENT_SIDE_MODE) {
+        for (const pending of pendingInputsRef.current) {
+          renderState = applyLocalPrediction(renderState, myPid, pending.payload, pending.dtSec);
+        }
 
-      const unsentMs = clamp(now - lastInputSentAtRef.current, 0, UNSENT_PREDICTION_MAX_MS);
-      if (unsentMs > 0) {
-        renderState = applyLocalPrediction(renderState, myPid, buildInputFromKeys(keysRef.current), unsentMs / 1000);
+        const unsentMs = clamp(now - lastInputSentAtRef.current, 0, UNSENT_PREDICTION_MAX_MS);
+        if (unsentMs > 0) {
+          renderState = applyLocalPrediction(renderState, myPid, buildInputFromKeys(keysRef.current), unsentMs / 1000);
+        }
       }
 
       if (joinedRef.current && gameStartedRef.current && keysRef.current.fire && localFireCooldownMsRef.current <= 0) {
@@ -865,15 +897,23 @@ export default function Page() {
     const merged = mergeDelta(worldRef.current, data);
     if (!merged) return;
 
+    const myPid = myIdRef.current;
+    if (BRUTAL_CLIENT_SIDE_MODE && myPid && localVisualPlayerRef.current) {
+      merged.players = {
+        ...merged.players,
+        [myPid]: blendServerAndLocalPlayer(merged.players[myPid], localVisualPlayerRef.current),
+      };
+    }
     worldRef.current = merged;
 
-    const myPid = myIdRef.current;
-    if (myPid) {
+    if (myPid && !BRUTAL_CLIENT_SIDE_MODE) {
       const ack = Number(data?.ack_seq_by_player?.[myPid] || 0);
       if (ack > lastAckSeqRef.current) {
         lastAckSeqRef.current = ack;
         pendingInputsRef.current = pendingInputsRef.current.filter((ev) => ev.transportSeq > ack);
       }
+    } else if (BRUTAL_CLIENT_SIDE_MODE) {
+      pendingInputsRef.current = [];
     }
 
     const frame: SnapshotFrame = {
