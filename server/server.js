@@ -248,6 +248,10 @@ const wss = new WebSocketServer({ port: PORT, perMessageDeflate: false });
 
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url, `ws://localhost:${PORT}`);
+  if (url.pathname !== '/ws' && url.pathname !== '/' && url.pathname !== '/debug-ws') {
+    ws.close(1008, 'invalid path');
+    return;
+  }
   const token = url.searchParams.get('token');
   let session = { userId: null, roomId: null, sessionId: null };
   let pendingMessages = []; // Queue messages until auth completes

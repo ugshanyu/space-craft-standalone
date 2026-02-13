@@ -483,6 +483,15 @@ app.prepare().then(() => {
       return;
     }
 
+    // Dedicated game websocket endpoint. Keep "/" for backward compatibility
+    // while service realtime.ws_url is being migrated to "/ws".
+    if (reqUrl.pathname !== '/ws' && reqUrl.pathname !== '/') {
+      diag(cid, 'upgrade_skip_unknown', { path: reqUrl.pathname });
+      socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
     diag(cid, 'upgrade_request', {
       url: request.url?.slice(0, 120),
       path: reqUrl.pathname,
