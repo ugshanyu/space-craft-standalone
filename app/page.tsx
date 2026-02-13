@@ -5,6 +5,12 @@ import { useEffect, useRef, useState } from "react";
 type AnyObj = Record<string, any>;
 type InputEvent = { seq: number; payload: AnyObj };
 
+declare global {
+  interface Window {
+    Usion?: any;
+  }
+}
+
 /* ───── Constants (Must match server/game.js) ───── */
 const ACCEL = 60.0;
 const DRAG = 0.94;
