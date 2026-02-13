@@ -13,7 +13,7 @@ declare global {
 
 /* ───── constants ───── */
 const CANVAS_SIZE = 1100;
-const INPUT_SEND_MS = 33; // ~30 Hz input send rate
+const INPUT_SEND_MS = 16; // ~60 Hz input send rate for tighter steering sync
 const JOIN_RETRY_LIMIT = Number(process.env.NEXT_PUBLIC_JOIN_RETRY_LIMIT || 4);
 const JOIN_RETRY_BACKOFF_MS = 700;
 const UI_REFRESH_MS = 250; // React UI refresh rate (~4 Hz)
@@ -39,6 +39,24 @@ function isControlKey(e: KeyboardEvent) {
 /** Frame-rate-independent ease that matches the 20 Hz server physics. */
 function ease(dt: number) {
   return 1 - Math.pow(1 - EASE_FACTOR, dt / SERVER_DT);
+}
+
+function wrap100(v: number) {
+  return ((v % 100) + 100) % 100;
+}
+
+function wrapDelta100(from: number, to: number) {
+  let d = to - from;
+  if (d > 50) d -= 100;
+  if (d < -50) d += 100;
+  return d;
+}
+
+function blendAngle(from: number, to: number, alpha: number) {
+  let d = to - from;
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  return from + d * alpha;
 }
 
 /** Fast shallow clone of game state — much cheaper than structuredClone. */
@@ -104,6 +122,7 @@ export default function Page() {
   const lastServerMs = useRef(performance.now());
   const lastFrameMs = useRef(performance.now());
   const serverTickRef = useRef(0);
+  const lastFrameKeyRef = useRef("");
 
   /* ── SDK init ── */
   useEffect(() => {
@@ -270,6 +289,23 @@ export default function Page() {
         simPlayer(me, Number(ev.payload.turn || 0), Number(ev.payload.thrust || 0), SERVER_DT);
       }
     }
+
+    // Smooth local reconciliation: keep visual continuity and avoid snap-back jitter.
+    const prevLocal = renderRef.current?.players?.[id];
+    const nextLocal = rs.players?.[id];
+    if (prevLocal?.alive && nextLocal?.alive) {
+      const dx = wrapDelta100(prevLocal.x, nextLocal.x);
+      const dy = wrapDelta100(prevLocal.y, nextLocal.y);
+      const posErr = Math.hypot(dx, dy);
+      const alpha = posErr > 10 ? 1 : 0.22;
+
+      nextLocal.x = wrap100(prevLocal.x + dx * alpha);
+      nextLocal.y = wrap100(prevLocal.y + dy * alpha);
+      nextLocal.angle = blendAngle(Number(prevLocal.angle || 0), Number(nextLocal.angle || 0), alpha);
+      nextLocal.vx = Number(prevLocal.vx || 0) + (Number(nextLocal.vx || 0) - Number(prevLocal.vx || 0)) * alpha;
+      nextLocal.vy = Number(prevLocal.vy || 0) + (Number(nextLocal.vy || 0) - Number(prevLocal.vy || 0)) * alpha;
+    }
+
     renderRef.current = rs;
     lastServerMs.current = performance.now();
   }
@@ -356,6 +392,9 @@ export default function Page() {
         usion.game.onRealtime((d: AnyObj) => {
           if (d.room_id !== roomIdRef.current) return;
           if (d.protocol_version === "2") {
+            const frameKey = `${d.server_tick || 0}:${d.server_ts || 0}`;
+            if (frameKey === lastFrameKeyRef.current) return;
+            lastFrameKeyRef.current = frameKey;
             if (!startedRef.current) {
               setGameStarted(true);
               startedRef.current = true;
@@ -367,6 +406,9 @@ export default function Page() {
 
         usion.game.onStateUpdate((d: AnyObj) => {
           if (d.room_id !== roomIdRef.current) return;
+          const frameKey = `${d.server_tick || 0}:${d.server_ts || 0}`;
+          if (frameKey === lastFrameKeyRef.current) return;
+          lastFrameKeyRef.current = frameKey;
           if (!startedRef.current) {
             setGameStarted(true);
             startedRef.current = true;
