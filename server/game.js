@@ -2,8 +2,11 @@
  * Space Craft - Authoritative 2P shooter simulation.
  * Deterministic, fixed-step physics.
  *
- * Features:
- * - Big ships, big projectiles, no shield regen
+ * CS:GO-style lag compensation:
+ * - Position history for every player (30 ticks = 500ms at 60Hz)
+ * - Projectiles check collision against rewound target positions
+ * - Instant rewind hit-scan on projectile spawn for point-blank shots
+ * - No shield, no regen — damage goes straight to HP
  * - 3 power-up types: Laser, Bomb, Nova
  */
 
@@ -11,6 +14,11 @@ const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
 const TAU = Math.PI * 2;
 const STATE_PRECISION = 10000;
 const roundState = (v) => Math.round(v * STATE_PRECISION) / STATE_PRECISION;
+
+/** How many ticks of position history to keep per player (~500ms at 60Hz) */
+const POS_HISTORY_MAX = 30;
+/** Sim tick duration for position rewind calculations */
+const SIM_TICK_MS_REF = 16;
 
 export const CONFIG = {
   arenaWidth: 100,
@@ -62,9 +70,39 @@ export const CONFIG = {
   roundDurationMs: 180000,
 };
 
+const HIT_DIST_SQ = Math.pow(CONFIG.playerRadius + CONFIG.projectileRadius, 2);
+
 // Pickup types
 const PICKUP_TYPES = ['laser', 'bomb', 'nova'];
 
+// ---------------------------------------------------------------------------
+// Position history helpers (CS:GO-style rewind)
+// ---------------------------------------------------------------------------
+function recordPosition(player) {
+  if (!player.posHistory) player.posHistory = [];
+  player.posHistory.push({ x: player.x, y: player.y });
+  if (player.posHistory.length > POS_HISTORY_MAX) {
+    player.posHistory.shift();
+  }
+}
+
+/**
+ * Get the target's position from `lagMs` milliseconds ago.
+ * Returns the historical position if available, otherwise current position.
+ */
+function getRewindPos(player, lagMs) {
+  if (!lagMs || lagMs <= 0 || !player.posHistory || player.posHistory.length === 0) {
+    return { x: player.x, y: player.y };
+  }
+  const ticksBack = Math.round(lagMs / SIM_TICK_MS_REF);
+  const histLen = player.posHistory.length;
+  const idx = Math.max(0, histLen - 1 - ticksBack);
+  return player.posHistory[idx] || { x: player.x, y: player.y };
+}
+
+// ---------------------------------------------------------------------------
+// State management
+// ---------------------------------------------------------------------------
 export function initState(playerIds, seed) {
   const spawns = [
     { x: 18, y: 50, angle: 0 },
@@ -88,10 +126,12 @@ export function initState(playerIds, seed) {
       fireCooldownMs: 0,
       alive: true,
       // Special weapon state
-      specialWeapon: null, // 'laser' | 'bomb' | 'nova' | null
+      specialWeapon: null,
       specialUses: 0,
-      laserActiveMs: 0,     // remaining laser beam time
+      laserActiveMs: 0,
       novaCooldownMs: 0,
+      // Position history for lag compensation (NOT serialized to network)
+      posHistory: [],
       input: { turn: 0, thrust: 0, fire: false, firePressed: false, fireSeq: null, lagCompMs: 0 },
       stats: {
         kills: 0,
@@ -114,7 +154,6 @@ export function initState(playerIds, seed) {
     players,
     projectiles: [],
     pickups: [],
-    // Visual effects for client rendering
     effects: [],
     winnerIds: [],
     reason: null,
@@ -135,6 +174,9 @@ export function applyInput(state, playerId, payload) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Main tick
+// ---------------------------------------------------------------------------
 export function tick(state, dtMs) {
   if (state.phase !== 'playing') return state;
 
@@ -150,6 +192,7 @@ export function tick(state, dtMs) {
   for (const [pid, p] of Object.entries(state.players)) {
     if (!p.alive) continue;
 
+    // --- Movement ---
     p.angle = normalizeAngle(p.angle + p.input.turn * CONFIG.turnRate * dt);
 
     const thrust = p.input.thrust;
@@ -177,7 +220,10 @@ export function tick(state, dtMs) {
     clampPlayerToArena(p, state);
     quantizePlayerState(p);
 
-    // No shield regeneration at all
+    // Record position for lag compensation AFTER movement
+    recordPosition(p);
+
+    // No shield regeneration
     p.fireCooldownMs = Math.max(0, p.fireCooldownMs - dtMs);
     p.novaCooldownMs = Math.max(0, (p.novaCooldownMs || 0) - dtMs);
 
@@ -186,8 +232,7 @@ export function tick(state, dtMs) {
       if (p.specialWeapon && p.specialUses > 0) {
         fireSpecialWeapon(state, pid, p);
       } else {
-        // Normal projectile
-        const lagCompMs = p.input.firePressed ? p.input.lagCompMs : 0;
+        const lagCompMs = p.input.lagCompMs || 0;
         spawnProjectile(state, pid, p, lagCompMs, p.input.fireSeq);
         p.fireCooldownMs = CONFIG.fireCooldownMs;
       }
@@ -199,7 +244,6 @@ export function tick(state, dtMs) {
     if (p.specialWeapon === 'laser' && p.input.fire && p.specialUses > 0) {
       p.laserActiveMs = (p.laserActiveMs || 0) + dtMs;
       applyLaserDamage(state, pid, p, dt);
-      // Consume uses over time
       if (p.laserActiveMs >= CONFIG.laserDurationMs) {
         p.specialUses -= 1;
         p.laserActiveMs = 0;
@@ -220,10 +264,12 @@ export function tick(state, dtMs) {
   return state;
 }
 
+// ---------------------------------------------------------------------------
+// Special weapons
+// ---------------------------------------------------------------------------
 function fireSpecialWeapon(state, pid, p) {
   switch (p.specialWeapon) {
     case 'bomb': {
-      // Launch a bomb projectile (slower, bigger, explodes on impact or timeout)
       const muzzle = CONFIG.playerRadius + 1;
       const pr = {
         id: `bomb:${state.tick}:${pid}`,
@@ -236,6 +282,7 @@ function fireSpecialWeapon(state, pid, p) {
         fireSeq: p.input.fireSeq || undefined,
         damage: CONFIG.bombDamage,
         isBomb: true,
+        lagCompMs: p.input.lagCompMs || 0,
       };
       quantizeProjectileState(pr);
       state.projectiles.push(pr);
@@ -248,13 +295,14 @@ function fireSpecialWeapon(state, pid, p) {
       break;
     }
     case 'nova': {
-      // Instant radius explosion around the player
       if (p.novaCooldownMs <= 0) {
         for (const [tid, target] of Object.entries(state.players)) {
           if (tid === pid || !target.alive) continue;
-          const d = Math.hypot(target.x - p.x, target.y - p.y);
+          // Use rewound position for lag compensation
+          const targetPos = getRewindPos(target, p.input.lagCompMs);
+          const d = Math.hypot(targetPos.x - p.x, targetPos.y - p.y);
           if (d <= CONFIG.novaRadius) {
-            const falloff = 1 - (d / CONFIG.novaRadius) * 0.5; // 100% at center, 50% at edge
+            const falloff = 1 - (d / CONFIG.novaRadius) * 0.5;
             const dmg = Math.round(CONFIG.novaDamage * falloff);
             target.hp = Math.max(0, target.hp - dmg);
             p.stats.damageDealt += dmg;
@@ -265,7 +313,6 @@ function fireSpecialWeapon(state, pid, p) {
             }
           }
         }
-        // Visual effect
         state.effects.push({
           type: 'nova',
           x: p.x,
@@ -284,25 +331,25 @@ function fireSpecialWeapon(state, pid, p) {
       break;
     }
     case 'laser': {
-      // Laser is handled continuously in the tick loop, not on firePressed
-      // But pressing fire with laser should not consume the normal fire cooldown
       break;
     }
   }
 }
 
 function applyLaserDamage(state, pid, p, dt) {
-  // Raycast beam from player position in facing direction
   const beamDps = CONFIG.laserDps;
   const beamRange = CONFIG.laserRangeUnits;
   const beamHalfWidth = CONFIG.laserWidthUnits / 2;
+  const ownerLag = p.input.lagCompMs || 0;
 
   for (const [tid, target] of Object.entries(state.players)) {
     if (tid === pid || !target.alive) continue;
 
-    // Point-to-line-segment distance
-    const dx = target.x - p.x;
-    const dy = target.y - p.y;
+    // Use rewound position for lag compensation
+    const targetPos = getRewindPos(target, ownerLag);
+
+    const dx = targetPos.x - p.x;
+    const dy = targetPos.y - p.y;
     const beamDirX = Math.cos(p.angle);
     const beamDirY = Math.sin(p.angle);
     const proj = dx * beamDirX + dy * beamDirY;
@@ -310,7 +357,6 @@ function applyLaserDamage(state, pid, p, dt) {
     const perpDist = Math.abs(dx * (-beamDirY) + dy * beamDirX);
     if (perpDist > beamHalfWidth + CONFIG.playerRadius) continue;
 
-    // Hit! Apply DPS
     const dmg = beamDps * dt;
     target.hp = Math.max(0, target.hp - dmg);
     p.stats.damageDealt += dmg;
@@ -334,39 +380,107 @@ export function isTerminal(state) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Projectiles — with CS:GO-style lag-compensated collision
+// ---------------------------------------------------------------------------
+
+/**
+ * Spawn a projectile. Advance its start position by lag compensation,
+ * then immediately do a REWIND HIT-SCAN check:
+ * Trace the projectile's path over the lag-compensated window against
+ * the target's rewound positions. If it hits, apply damage instantly.
+ */
 function spawnProjectile(state, ownerId, p, lagCompMs = 0, fireSeq = null) {
   const muzzle = CONFIG.playerRadius + 0.5;
   const minX = CONFIG.projectileRadius;
   const maxX = state.arena.width - CONFIG.projectileRadius;
   const minY = CONFIG.projectileRadius;
   const maxY = state.arena.height - CONFIG.projectileRadius;
+
+  // Spawn at muzzle
+  const spawnX = clamp(p.x + Math.cos(p.angle) * muzzle, minX, maxX);
+  const spawnY = clamp(p.y + Math.sin(p.angle) * muzzle, minY, maxY);
+
   const pr = {
     id: `${state.tick}:${ownerId}:${Math.random().toString(36).slice(2, 7)}`,
     ownerId,
-    x: clamp(p.x + Math.cos(p.angle) * muzzle, minX, maxX),
-    y: clamp(p.y + Math.sin(p.angle) * muzzle, minY, maxY),
+    x: spawnX,
+    y: spawnY,
     vx: Math.cos(p.angle) * CONFIG.projectileSpeed,
     vy: Math.sin(p.angle) * CONFIG.projectileSpeed,
     ttlMs: CONFIG.projectileTtlMs,
     fireSeq: Number.isFinite(Number(fireSeq)) && Number(fireSeq) > 0 ? Math.floor(Number(fireSeq)) : undefined,
     damage: CONFIG.projectileDamage,
     isBomb: false,
+    lagCompMs: clamp(Number(lagCompMs || 0), 0, CONFIG.maxLagCompensationMs),
   };
 
-  const appliedLagMs = clamp(Number(lagCompMs || 0), 0, CONFIG.maxLagCompensationMs);
+  const appliedLagMs = pr.lagCompMs;
+
+  // --- Instant rewind hit-scan ---
+  // Check if the projectile's path during the lag window hits any rewound target.
+  // This catches point-blank and close-range shots that would have already connected.
   if (appliedLagMs > 0) {
     const lagDt = appliedLagMs / 1000;
-    pr.x += pr.vx * lagDt;
-    pr.y += pr.vy * lagDt;
-    pr.x = clamp(pr.x, minX, maxX);
-    pr.y = clamp(pr.y, minY, maxY);
+    const steps = Math.ceil(appliedLagMs / SIM_TICK_MS_REF);
+    const stepDt = lagDt / steps;
+    let checkX = spawnX;
+    let checkY = spawnY;
+
+    let instantHitPid = null;
+    for (let s = 0; s < steps; s++) {
+      checkX += pr.vx * stepDt;
+      checkY += pr.vy * stepDt;
+      if (checkX < minX || checkX > maxX || checkY < minY || checkY > maxY) break;
+
+      // Check against rewound positions at proportional time
+      const rewindMs = appliedLagMs - (s + 1) * SIM_TICK_MS_REF;
+      for (const [pid, target] of Object.entries(state.players)) {
+        if (!target.alive || pid === ownerId) continue;
+        const rPos = getRewindPos(target, Math.max(0, rewindMs));
+        if (distSq(checkX, checkY, rPos.x, rPos.y) <= HIT_DIST_SQ) {
+          instantHitPid = pid;
+          break;
+        }
+      }
+      if (instantHitPid) break;
+    }
+
+    if (instantHitPid) {
+      // Instant hit! Apply damage, don't create the projectile (it already hit)
+      const target = state.players[instantHitPid];
+      target.hp = Math.max(0, target.hp - pr.damage);
+      p.stats.damageDealt += pr.damage;
+      if (target.hp <= 0 && target.alive) {
+        target.alive = false;
+        target.stats.deaths += 1;
+        p.stats.kills += 1;
+      }
+      // Still push a very-short-lived projectile so the client sees the shot
+      pr.x = checkX;
+      pr.y = checkY;
+      pr.ttlMs = 50; // just enough for one network tick to see it
+      quantizeProjectileState(pr);
+      state.projectiles.push(pr);
+      return;
+    }
+
+    // No instant hit — advance projectile start position normally
+    pr.x = clamp(spawnX + pr.vx * lagDt, minX, maxX);
+    pr.y = clamp(spawnY + pr.vy * lagDt, minY, maxY);
     pr.ttlMs = Math.max(0, pr.ttlMs - appliedLagMs);
   }
-  quantizeProjectileState(pr);
 
+  quantizeProjectileState(pr);
   state.projectiles.push(pr);
 }
 
+/**
+ * Update projectiles with lag-compensated collision.
+ * For each projectile, check collision against BOTH:
+ * 1. Current target position (fair for all latencies)
+ * 2. Rewound target position (for the shooter's lag) — ensures "what you see is what you hit"
+ */
 function updateProjectiles(state, dtMs) {
   const dt = dtMs / 1000;
   const kept = [];
@@ -374,7 +488,6 @@ function updateProjectiles(state, dtMs) {
   for (const pr of state.projectiles) {
     pr.ttlMs -= dtMs;
     if (pr.ttlMs <= 0) {
-      // Bombs explode on timeout
       if (pr.isBomb) triggerBombExplosion(state, pr);
       continue;
     }
@@ -387,12 +500,27 @@ function updateProjectiles(state, dtMs) {
     }
     quantizeProjectileState(pr);
 
+    // --- Lag-compensated collision detection ---
     let hit = null;
+    const ownerLag = pr.lagCompMs || 0;
+
     for (const [pid, p] of Object.entries(state.players)) {
       if (!p.alive || pid === pr.ownerId) continue;
-      if (distSq(pr.x, pr.y, p.x, p.y) <= Math.pow(CONFIG.playerRadius + CONFIG.projectileRadius, 2)) {
+
+      // Check 1: Current position (always checked)
+      if (distSq(pr.x, pr.y, p.x, p.y) <= HIT_DIST_SQ) {
         hit = pid;
         break;
+      }
+
+      // Check 2: Rewound position (lag compensation)
+      // This makes bullets hit where the shooter SAW the target
+      if (ownerLag > 0) {
+        const rewound = getRewindPos(p, ownerLag);
+        if (distSq(pr.x, pr.y, rewound.x, rewound.y) <= HIT_DIST_SQ) {
+          hit = pid;
+          break;
+        }
       }
     }
 
@@ -405,7 +533,6 @@ function updateProjectiles(state, dtMs) {
     if (pr.isBomb) {
       triggerBombExplosion(state, pr);
     } else {
-      // Normal projectile — direct HP damage (no shield)
       const target = state.players[hit];
       const owner = state.players[pr.ownerId];
       target.hp = Math.max(0, target.hp - pr.damage);
@@ -423,14 +550,15 @@ function updateProjectiles(state, dtMs) {
 
 function triggerBombExplosion(state, pr) {
   const owner = state.players[pr.ownerId];
-  // Damage all players in blast radius (including owner!)
+  const ownerLag = pr.lagCompMs || 0;
   for (const [pid, p] of Object.entries(state.players)) {
     if (!p.alive) continue;
-    const d = Math.hypot(p.x - pr.x, p.y - pr.y);
+    // Use rewound position for blast radius check
+    const pos = pid !== pr.ownerId ? getRewindPos(p, ownerLag) : { x: p.x, y: p.y };
+    const d = Math.hypot(pos.x - pr.x, pos.y - pr.y);
     if (d <= CONFIG.bombRadius) {
       const falloff = 1 - (d / CONFIG.bombRadius) * 0.6;
       const dmg = Math.round(CONFIG.bombDamage * falloff);
-      // Self-damage is halved
       const actualDmg = pid === pr.ownerId ? Math.round(dmg * 0.5) : dmg;
       p.hp = Math.max(0, p.hp - actualDmg);
       if (owner && pid !== pr.ownerId) owner.stats.damageDealt += actualDmg;
@@ -441,7 +569,6 @@ function triggerBombExplosion(state, pr) {
       }
     }
   }
-  // Visual effect
   state.effects.push({
     type: 'explosion',
     x: pr.x,
@@ -452,6 +579,9 @@ function triggerBombExplosion(state, pr) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Pickups
+// ---------------------------------------------------------------------------
 function spawnPickups(state) {
   if (state.tick % CONFIG.pickupSpawnEveryTicks !== 0) return;
   if (state.pickups.length >= CONFIG.maxPickups) return;
@@ -464,7 +594,6 @@ function spawnPickups(state) {
   const minY = CONFIG.pickupRadius + 5;
   const maxY = state.arena.height - CONFIG.pickupRadius - 5;
 
-  // Pick a random type from the 3 special weapons
   const typeIndex = Math.floor(r3 * PICKUP_TYPES.length) % PICKUP_TYPES.length;
   const pickupType = PICKUP_TYPES[typeIndex];
 
@@ -495,7 +624,6 @@ function collectPickups(state) {
     }
 
     const collector = state.players[collectorId];
-    // Grant the special weapon
     collector.specialWeapon = pickup.type;
     collector.specialUses = pickup.value;
     collector.laserActiveMs = 0;
@@ -505,6 +633,9 @@ function collectPickups(state) {
   state.pickups = rest;
 }
 
+// ---------------------------------------------------------------------------
+// Terminal check
+// ---------------------------------------------------------------------------
 function resolveTerminal(state) {
   const alive = Object.entries(state.players)
     .filter(([, p]) => p.alive)
@@ -529,6 +660,9 @@ function resolveTerminal(state) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Utility
+// ---------------------------------------------------------------------------
 function pseudoRandom(seed) {
   const x = Math.sin(seed * 12.9898) * 43758.5453;
   return x - Math.floor(x);

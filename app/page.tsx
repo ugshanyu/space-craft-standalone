@@ -88,7 +88,8 @@ const PROJECTILE_RADIUS = 0.8;
 const INPUT_SEND_MS_BASE = 16;
 const INPUT_SEND_MS_HIGH_RTT = 50;
 const HIGH_RTT_THRESHOLD = 100;
-const INTERP_DELAY_MS = Number(process.env.NEXT_PUBLIC_INTERP_DELAY_MS || (BRUTAL_CLIENT_SIDE_MODE ? 20 : 10));
+const INTERP_DELAY_MS_LAN = Number(process.env.NEXT_PUBLIC_INTERP_DELAY_MS || 10);
+const INTERP_DELAY_MS_HIGH = 30;
 const UI_TICK_UPDATE_EVERY = 2;
 const MAX_PENDING_INPUTS = 120;
 const IMMEDIATE_INPUT_MIN_GAP_MS = 12;
@@ -111,6 +112,11 @@ const DESYNC_SNAP_THRESHOLD = 15;
 function getInputSendMs(rttMs: number): number {
   if (!rttMs || rttMs <= HIGH_RTT_THRESHOLD) return INPUT_SEND_MS_BASE;
   return INPUT_SEND_MS_HIGH_RTT;
+}
+
+function getInterpDelayMs(rttMs: number): number {
+  if (!rttMs || rttMs <= HIGH_RTT_THRESHOLD) return INTERP_DELAY_MS_LAN;
+  return INTERP_DELAY_MS_HIGH;
 }
 
 const TURN_RATE = 3.8;
@@ -916,7 +922,7 @@ export default function Page() {
     const frameDtSec = frameDtMs / 1000;
     lastRenderAtRef.current = now;
 
-    const target = now - INTERP_DELAY_MS;
+    const target = now - getInterpDelayMs(pingRef.current.emaRttMs);
     const snapshots = snapshotsRef.current;
 
     if (snapshots.length === 0) return;
