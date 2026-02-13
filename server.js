@@ -573,9 +573,10 @@ app.prepare().then(() => {
           state: readyStateName(ws),
         });
 
-        // Send auth_ok only if the socket is still open.
-        if (!sendJson(ws, cid, { type: 'auth_ok', payload: { session_id: session.sessionId, room_id: session.roomId } }, 'auth_ok')) {
-          console.warn(`[WS][${cid}] skip_auth_ok_not_open`, { readyState: readyStateName(ws) });
+        // SDK does not require an auth_ok frame for direct mode.
+        // Keep the connection passive until the client sends "join".
+        if (ws.readyState !== ws.OPEN) {
+          diag(cid, 'auth_ok_socket_not_open', { readyState: readyStateName(ws) });
           return;
         }
 

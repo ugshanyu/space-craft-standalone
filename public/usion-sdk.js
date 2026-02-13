@@ -1511,7 +1511,7 @@
                 self._directJoinResolve = null;
                 self._directJoinReject = null;
               }
-            }, 15000);
+            }, 30000);
             if (!self._joined) self._sendDirect('join', {});
           });
           return self._joinPromise;
@@ -1528,7 +1528,7 @@
                 self._proxyJoinReject = null;
                 reject(new Error('Join timeout'));
               }
-            }, 15000);
+            }, 30000);
           });
           return self._joinPromise;
         }

@@ -5,14 +5,38 @@
  */
 import { createRemoteJWKSet, jwtVerify, decodeJwt } from 'jose';
 
-let jwksCache = null;
+const jwksCacheByUrl = new Map();
 const AUTH_DIAG = process.env.AUTH_DIAG === '1';
+const JWKS_TIMEOUT_MS = Number(process.env.JWKS_TIMEOUT_MS || 15000);
+const JWKS_CACHE_MAX_AGE_MS = Number(process.env.JWKS_CACHE_MAX_AGE_MS || 300000);
+const JWKS_COOLDOWN_MS = Number(process.env.JWKS_COOLDOWN_MS || 1000);
 
-function getJWKS(jwksUrl) {
-  if (!jwksCache) {
-    jwksCache = createRemoteJWKSet(new URL(jwksUrl));
+function getJWKS(jwksUrl, forceRefresh = false) {
+  if (forceRefresh) {
+    jwksCacheByUrl.delete(jwksUrl);
   }
-  return jwksCache;
+  let cached = jwksCacheByUrl.get(jwksUrl);
+  if (!cached) {
+    cached = createRemoteJWKSet(new URL(jwksUrl), {
+      timeoutDuration: JWKS_TIMEOUT_MS,
+      cacheMaxAge: JWKS_CACHE_MAX_AGE_MS,
+      cooldownDuration: JWKS_COOLDOWN_MS,
+    });
+    jwksCacheByUrl.set(jwksUrl, cached);
+  }
+  return cached;
+}
+
+function isJwksRetryableError(err) {
+  const name = err?.name || '';
+  const msg = String(err?.message || '');
+  return (
+    name === 'JWSSignatureVerificationFailed' ||
+    name === 'JWKSNoMatchingKey' ||
+    msg.includes('signature verification failed') ||
+    msg.includes('no applicable key') ||
+    msg.includes('no matching key')
+  );
 }
 
 export async function validateAccessToken(token, {
@@ -22,7 +46,6 @@ export async function validateAccessToken(token, {
   expectedServiceId,
   expectedRoomId = null,
 }) {
-  const jwks = getJWKS(jwksUrl);
   const expectedAudience = `${expectedAudiencePrefix}${expectedServiceId}`;
 
   // Optional diagnostics (disabled by default to reduce auth path latency/log noise).
@@ -39,12 +62,25 @@ export async function validateAccessToken(token, {
   }
 
   try {
-    const { payload } = await jwtVerify(token, jwks, {
+    const verifyOptions = {
       issuer: expectedIssuer,
       audience: expectedAudience,
       algorithms: ['RS256'],
       clockTolerance: 60, // Allow 60 seconds of clock skew
-    });
+    };
+
+    let verified;
+    try {
+      const jwks = getJWKS(jwksUrl);
+      verified = await jwtVerify(token, jwks, verifyOptions);
+    } catch (err) {
+      if (!isJwksRetryableError(err)) throw err;
+      // Backend restarts can rotate key material under the same kid.
+      // Force-refresh JWKS and retry once before failing auth.
+      const refreshedJwks = getJWKS(jwksUrl, true);
+      verified = await jwtVerify(token, refreshedJwks, verifyOptions);
+    }
+    const { payload } = verified;
 
     // Additional claim checks
     if (payload.service_id !== expectedServiceId) {

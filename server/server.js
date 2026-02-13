@@ -272,6 +272,10 @@ wss.on('connection', (ws, req) => {
       console.log('[WS] Connection authenticated:', session);
       console.log('[WS] Token timestamps: iat=', payload.iat, 'exp=', payload.exp, 'now=', now, 'remaining=', payload.exp - now, 'seconds');
 
+      // SDK does not require an auth_ok frame for direct mode.
+      // Keep connection open and wait for client "join".
+      if (ws.readyState !== 1) return;
+
       // Process any messages that arrived while authenticating
       if (pendingMessages.length > 0) {
         console.log(`[WS] Processing ${pendingMessages.length} queued message(s)`);
