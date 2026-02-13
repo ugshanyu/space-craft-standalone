@@ -21,6 +21,7 @@ const SIGNING_SECRET = process.env.SIGNING_SECRET || 'CHANGE_ME_IN_PRODUCTION';
 const TICK_RATE_HZ = 20;
 const TICK_MS = 1000 / TICK_RATE_HZ;
 const SNAPSHOT_INTERVAL_TICKS = 20;
+const WS_DEBUG_PROBE = process.env.WS_DEBUG_PROBE === '1';
 
 const rooms = new Map(); // roomId -> RoomRuntime
 
@@ -252,6 +253,51 @@ wss.on('connection', (ws, req) => {
   let pendingMessages = []; // Queue messages until auth completes
   let authComplete = false;
 
+  if (url.pathname === '/debug-ws') {
+    if (!WS_DEBUG_PROBE) {
+      ws.close(1008, 'debug probe disabled');
+      return;
+    }
+
+    ws.send(JSON.stringify({
+      type: 'debug_connected',
+      payload: { ts: Date.now(), has_token: !!token },
+    }));
+
+    if (token) {
+      validateAccessToken(token, {
+        jwksUrl: JWKS_URL,
+        expectedServiceId: SERVICE_ID,
+      })
+        .then((payload) => {
+          ws.send(JSON.stringify({
+            type: 'debug_token_ok',
+            payload: {
+              user_id: payload.sub,
+              room_id: payload.room_id,
+              session_id: payload.session_id,
+              iat: payload.iat,
+              exp: payload.exp,
+            },
+          }));
+        })
+        .catch((err) => {
+          ws.send(JSON.stringify({
+            type: 'debug_token_error',
+            payload: { message: err.message },
+          }));
+        });
+    }
+
+    ws.on('message', (data) => {
+      ws.send(JSON.stringify({
+        type: 'debug_echo',
+        payload: { ts: Date.now(), len: data.length || 0, text: data.toString() },
+      }));
+    });
+    return;
+  }
+
   if (!token) {
     ws.send(JSON.stringify({ type: 'error', payload: { code: 'NO_TOKEN', message: 'Missing access token' } }));
     ws.close();
@@ -440,3 +486,4 @@ console.log(`[SERVER] Space Craft Direct Mode WebSocket Server running on port $
 console.log(`[SERVER] Service ID: ${SERVICE_ID}`);
 console.log(`[SERVER] JWKS URL: ${JWKS_URL}`);
 console.log(`[SERVER] API URL: ${API_URL}`);
+console.log(`[SERVER] WS_DEBUG_PROBE: ${WS_DEBUG_PROBE}`);
