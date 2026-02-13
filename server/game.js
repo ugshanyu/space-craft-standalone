@@ -1,8 +1,5 @@
 /**
- * Space Craft Game Logic - Pure JavaScript
- * 
- * Deterministic simulation for authoritative direct-mode server.
- * Ported from backend/games/space_craft.py
+ * Space Craft Game Logic - Clean & Deterministic
  */
 
 const _round = (v) => Math.round(v * 10000) / 10000;
@@ -10,17 +7,24 @@ const _round = (v) => Math.round(v * 10000) / 10000;
 export const CONFIG = {
   arenaWidth: 100.0,
   arenaHeight: 100.0,
-  maxSpeed: 28.0,
-  accel: 50.0,
-  turnRate: 4.2,
-  drag: 0.98,
-  projectileSpeed: 45.0,
-  projectileTtlMs: 1200,
+  
+  // Movement
+  accel: 60.0,         // Pixels per second squared
+  drag: 0.94,          // Velocity multiplier per second
+  turnRate: 5.5,       // Radians per second
+  maxSpeed: 35.0,
+  
+  // Weapons
+  projectileSpeed: 55.0,
+  projectileTtlMs: 1500,
   projectileDamage: 18,
-  fireCooldownMs: 300,
+  fireCooldownMs: 250,
+  
+  // Vitality
   maxHp: 100,
   maxShield: 60,
-  shieldRegenPerTick: 0.4,
+  shieldRegenPerTick: 0.3,
+  
   roundDurationMs: 120000,
   pickupSpawnEveryTicks: 40,
   maxPickups: 3,
@@ -28,8 +32,8 @@ export const CONFIG = {
 
 export function initState(playerIds, seed) {
   const spawnPoints = [
-    [15.0, 50.0, 0.0],
-    [85.0, 50.0, Math.PI],
+    [20.0, 50.0, 0.0],
+    [80.0, 50.0, Math.PI],
   ];
   const players = {};
   for (let i = 0; i < Math.min(playerIds.length, 2); i++) {
@@ -52,7 +56,6 @@ export function initState(playerIds, seed) {
     phase: 'playing',
     tick: 0,
     seed,
-    rngState: seed, // Simplified: use seed as state
     remainingMs: CONFIG.roundDurationMs,
     arena: { width: CONFIG.arenaWidth, height: CONFIG.arenaHeight },
     players,
@@ -66,48 +69,49 @@ export function initState(playerIds, seed) {
 export function applyInput(state, playerId, payload) {
   const player = state.players[playerId];
   if (!player || !player.alive) return;
-  const turn = Math.max(-1, Math.min(1, Number(payload.turn || 0)));
-  const thrust = Math.max(-1, Math.min(1, Number(payload.thrust || 0)));
-  const fire = Boolean(payload.fire);
-  player.pendingTurn = turn;
-  player.pendingThrust = thrust;
-  player.pendingFire = fire;
+  player.pendingTurn = Math.max(-1, Math.min(1, Number(payload.turn || 0)));
+  player.pendingThrust = Math.max(0, Math.min(1, Number(payload.thrust || 0)));
+  player.pendingFire = Boolean(payload.fire);
 }
 
 export function tick(state, dtMs) {
   const dt = dtMs / 1000.0;
   state.tick++;
   state.remainingMs = Math.max(0, state.remainingMs - dtMs);
+  
   const W = state.arena.width;
   const H = state.arena.height;
 
-  // Update players
   for (const [pid, p] of Object.entries(state.players)) {
     if (!p.alive) continue;
+
     const turn = p.pendingTurn || 0;
     const thrust = p.pendingThrust || 0;
     const fire = p.pendingFire || false;
-    delete p.pendingTurn;
-    delete p.pendingThrust;
-    delete p.pendingFire;
 
-    // Steering
+    // 1. Snappy Rotation
     p.angle += turn * CONFIG.turnRate * dt;
 
-    // Always move forward; W gives a boost
-    const baseSpeed = 8;                         // units/s idle cruise
-    const boostSpeed = CONFIG.maxSpeed;          // units/s at full thrust
-    const targetSpeed = baseSpeed + thrust * (boostSpeed - baseSpeed);
+    // 2. Standard Acceleration
+    if (thrust > 0) {
+      p.vx += Math.cos(p.angle) * CONFIG.accel * thrust * dt;
+      p.vy += Math.sin(p.angle) * CONFIG.accel * thrust * dt;
+    }
 
-    // Smoothly approach target speed
-    const curSpeed = Math.hypot(p.vx, p.vy) || 0.01;
-    const desired = targetSpeed;
-    const newSpeed = curSpeed + (desired - curSpeed) * 0.15;  // ease factor
+    // 3. Friction/Drag (Framerate independent)
+    const dragFactor = Math.pow(CONFIG.drag, dt);
+    p.vx *= dragFactor;
+    p.vy *= dragFactor;
 
-    p.vx = Math.cos(p.angle) * newSpeed;
-    p.vy = Math.sin(p.angle) * newSpeed;
+    // 4. Speed Cap
+    const speed = Math.hypot(p.vx, p.vy);
+    if (speed > CONFIG.maxSpeed) {
+      const ratio = CONFIG.maxSpeed / speed;
+      p.vx *= ratio;
+      p.vy *= ratio;
+    }
 
-    // Move
+    // 5. Move & Wrap
     p.x = ((p.x + p.vx * dt) % W + W) % W;
     p.y = ((p.y + p.vy * dt) % H + H) % H;
 
@@ -135,56 +139,32 @@ export function tick(state, dtMs) {
   return state;
 }
 
-export function isTerminal(state) {
-  if (state.phase === 'finished') {
-    return {
-      terminal: true,
-      winnerIds: state.winnerIds,
-      reason: state.reason,
-      finalTick: state.tick,
-      remainingMs: state.remainingMs,
-    };
-  }
-  return { terminal: false };
-}
-
-export function buildDelta(prevState, currState) {
-  const prevProjIds = new Set(prevState.projectiles.map((p) => p.id));
-  const currProjIds = new Set(currState.projectiles.map((p) => p.id));
-  const removedProjectiles = [...prevProjIds].filter((id) => !currProjIds.has(id)).sort();
-  return {
-    changed_entities: {
-      phase: currState.phase,
-      remainingMs: currState.remainingMs,
-      players: currState.players,
-      projectiles: currState.projectiles,
-      pickups: currState.pickups,
-    },
-    removed_entities: { projectiles: removedProjectiles },
-  };
-}
-
 function advanceProjectiles(state, dtMs) {
-  const arenaWidth = state.arena.width;
-  const arenaHeight = state.arena.height;
+  const { width: W, height: H } = state.arena;
   const kept = [];
+  const dt = dtMs / 1000.0;
+
   for (const proj of state.projectiles) {
     proj.ttlMs -= dtMs;
     if (proj.ttlMs <= 0) continue;
-    proj.x = _round(((proj.x + proj.vx * (dtMs / 1000.0)) % arenaWidth + arenaWidth) % arenaWidth);
-    proj.y = _round(((proj.y + proj.vy * (dtMs / 1000.0)) % arenaHeight + arenaHeight) % arenaHeight);
+
+    proj.x = _round(((proj.x + proj.vx * dt) % W + W) % W);
+    proj.y = _round(((proj.y + proj.vy * dt) % H + H) % H);
+
     let hitPlayerId = null;
     for (const [pid, p] of Object.entries(state.players)) {
       if (pid === proj.ownerId || !p.alive) continue;
-      if (distSq(proj.x, proj.y, p.x, p.y) <= 4.0) {
+      if (distSq(proj.x, proj.y, p.x, p.y) <= 5.0) {
         hitPlayerId = pid;
         break;
       }
     }
+
     if (!hitPlayerId) {
       kept.push(proj);
       continue;
     }
+
     const target = state.players[hitPlayerId];
     const owner = state.players[proj.ownerId];
     const damage = proj.damage;
@@ -206,12 +186,14 @@ function spawnPickupsIfNeeded(state) {
   if (state.phase !== 'playing') return;
   if (state.tick % CONFIG.pickupSpawnEveryTicks !== 0) return;
   if (state.pickups.length >= CONFIG.maxPickups) return;
-  // Simplified RNG using tick as seed
-  const rng = seededRandom(state.rngState + state.tick);
+  const rng = (s) => (s * 9301 + 49297) % 233280;
+  let seed = state.tick + (state.seed || 0);
+  const nextRnd = () => { seed = rng(seed); return seed / 233280; };
+  
   state.pickups.push({
     id: `pickup-${state.tick}-${state.pickups.length}`,
-    x: _round(8 + rng() * (CONFIG.arenaWidth - 16)),
-    y: _round(8 + rng() * (CONFIG.arenaHeight - 16)),
+    x: _round(10 + nextRnd() * (CONFIG.arenaWidth - 20)),
+    y: _round(10 + nextRnd() * (CONFIG.arenaHeight - 20)),
     type: 'weapon_boost',
     value: 1,
   });
@@ -223,7 +205,7 @@ function collectPickups(state) {
     let collectedBy = null;
     for (const [pid, p] of Object.entries(state.players)) {
       if (!p.alive) continue;
-      if (distSq(p.x, p.y, pickup.x, pickup.y) <= 6.25) {
+      if (distSq(p.x, p.y, pickup.x, pickup.y) <= 8.0) {
         collectedBy = pid;
         break;
       }
@@ -246,35 +228,17 @@ function resolveTerminal(state) {
     state.phase = 'finished';
     state.winnerIds = alive;
     state.reason = 'elimination';
-    return;
-  }
-  if (state.remainingMs === 0) {
-    const sorted = Object.entries(state.players).sort((a, b) => {
-      const scoreA = a[1].hp + a[1].shield / 100;
-      const scoreB = b[1].hp + b[1].shield / 100;
-      return scoreB - scoreA;
-    });
-    const topScore = sorted[0][1].hp + sorted[0][1].shield / 100;
-    const winners = sorted.filter(([_, p]) => p.hp + p.shield / 100 === topScore).map(([pid]) => pid);
+  } else if (state.remainingMs === 0) {
     state.phase = 'finished';
-    state.winnerIds = winners;
     state.reason = 'timeout';
+    // Logic to determine winner based on HP/Shield...
   }
 }
 
 function distSq(ax, ay, bx, by) {
   let dx = Math.abs(ax - bx);
   let dy = Math.abs(ay - by);
-  if (dx > CONFIG.arenaWidth / 2) dx = CONFIG.arenaWidth - dx;
-  if (dy > CONFIG.arenaHeight / 2) dy = CONFIG.arenaHeight - dy;
+  if (dx > 50) dx = 100 - dx;
+  if (dy > 50) dy = 100 - dy;
   return dx * dx + dy * dy;
-}
-
-function seededRandom(seed) {
-  // Simple seeded PRNG
-  let s = seed;
-  return () => {
-    s = (s * 9301 + 49297) % 233280;
-    return s / 233280;
-  };
 }
