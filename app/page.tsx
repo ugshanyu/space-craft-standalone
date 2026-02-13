@@ -74,6 +74,13 @@ function wrap(v: number, max: number): number {
   return n;
 }
 
+function normalizeAngle(v: number): number {
+  const tau = Math.PI * 2;
+  let n = v % tau;
+  if (n < 0) n += tau;
+  return n;
+}
+
 function cloneWorld(state: AnyObj): WorldState {
   const players: Record<string, PlayerState> = {};
   for (const [pid, p] of Object.entries(state?.players || {})) {
@@ -235,7 +242,7 @@ function applyLocalPrediction(state: WorldState, myId: string, input: InputPaylo
   const pred = { ...state, players: { ...state.players, [myId]: { ...me } } };
   const p = pred.players[myId];
 
-  p.angle += input.turn * TURN_RATE * dtSec;
+  p.angle = normalizeAngle(p.angle + input.turn * TURN_RATE * dtSec);
 
   if (input.thrust !== 0) {
     const accel = input.thrust > 0 ? ACCEL_FORWARD : ACCEL_REVERSE;
@@ -411,6 +418,17 @@ export default function Page() {
 
     const myPid = myIdRef.current;
     if (myPid) {
+      const newest = snapshots[snapshots.length - 1]?.state;
+      const newestMe = newest?.players?.[myPid];
+      if (newestMe) {
+        renderState = {
+          ...renderState,
+          players: {
+            ...renderState.players,
+            [myPid]: { ...newestMe },
+          },
+        };
+      }
       for (const pending of pendingInputsRef.current) {
         renderState = applyLocalPrediction(renderState, myPid, pending.payload, INPUT_SEND_MS / 1000);
       }
@@ -514,6 +532,11 @@ export default function Page() {
 
         usion.game.onJoined((data: AnyObj) => {
           if (data?.room_id && data.room_id !== activeRoomIdRef.current) return;
+          const joinedPlayerId = String(data?.player_id || "");
+          if (joinedPlayerId) {
+            myIdRef.current = joinedPlayerId;
+            setMyId(joinedPlayerId);
+          }
           pendingInputsRef.current = [];
           lastAckSeqRef.current = 0;
           lastNetworkTickRef.current = 0;
@@ -563,6 +586,11 @@ export default function Page() {
           await usion.game.connectDirect();
           const joinRes = await usion.game.join(rid);
           if (joinRes?.error) throw new Error(String(joinRes.error));
+          const joinedPlayerId = String(joinRes?.player_id || "");
+          if (joinedPlayerId) {
+            myIdRef.current = joinedPlayerId;
+            setMyId(joinedPlayerId);
+          }
 
           setJoined(true);
           setPlayerCount((joinRes?.player_ids || []).length);
