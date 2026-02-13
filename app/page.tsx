@@ -33,6 +33,7 @@ type SnapshotFrame = {
 };
 
 type InputPayload = { turn: number; thrust: number; fire: boolean };
+type PendingInput = { transportSeq: number; payload: InputPayload };
 
 declare global {
   interface Window {
@@ -45,7 +46,7 @@ const JOIN_RETRY_LIMIT = Number(process.env.NEXT_PUBLIC_JOIN_RETRY_LIMIT || 4);
 const JOIN_RETRY_BACKOFF_MS = 600;
 
 const INPUT_SEND_MS = 33;
-const INTERP_DELAY_MS = 95;
+const INTERP_DELAY_MS = 60;
 const UI_TICK_UPDATE_EVERY = 2;
 
 const TURN_RATE = 3.8;
@@ -274,6 +275,9 @@ export default function Page() {
   const worldRef = useRef<WorldState | null>(null);
   const snapshotsRef = useRef<SnapshotFrame[]>([]);
   const keysRef = useRef({ up: false, down: false, left: false, right: false, fire: false });
+  const pendingInputsRef = useRef<PendingInput[]>([]);
+  const lastAckSeqRef = useRef(0);
+  const lastNetworkTickRef = useRef(0);
 
   const inputTimerRef = useRef<number | null>(null);
   const rafRef = useRef<number | null>(null);
@@ -336,7 +340,7 @@ export default function Page() {
         rafRef.current = null;
       }
     };
-  });
+  }, []);
 
   useEffect(() => {
     const usion = window.Usion;
@@ -346,6 +350,13 @@ export default function Page() {
       inputTimerRef.current = window.setInterval(() => {
         const input = buildInputFromKeys(keysRef.current);
         usion.game.realtime("control", input);
+        const transportSeq = Number(usion?.game?._directSeq || 0);
+        if (transportSeq > 0) {
+          pendingInputsRef.current.push({ transportSeq, payload: input });
+          if (pendingInputsRef.current.length > 120) {
+            pendingInputsRef.current.splice(0, pendingInputsRef.current.length - 120);
+          }
+        }
       }, INPUT_SEND_MS);
     }
 
@@ -400,8 +411,9 @@ export default function Page() {
 
     const myPid = myIdRef.current;
     if (myPid) {
-      const input = buildInputFromKeys(keysRef.current);
-      renderState = applyLocalPrediction(renderState, myPid, input, INPUT_SEND_MS / 1000);
+      for (const pending of pendingInputsRef.current) {
+        renderState = applyLocalPrediction(renderState, myPid, pending.payload, INPUT_SEND_MS / 1000);
+      }
     }
 
     drawWorld(renderState, canvas, myPid);
@@ -422,15 +434,29 @@ export default function Page() {
 
   function onNetworkState(data: AnyObj) {
     if (!data || data.room_id !== activeRoomIdRef.current) return;
+    const tick = Number(data.server_tick || 0);
+    if (tick > 0) {
+      if (tick <= lastNetworkTickRef.current) return;
+      lastNetworkTickRef.current = tick;
+    }
 
     const merged = mergeDelta(worldRef.current, data);
     if (!merged) return;
 
     worldRef.current = merged;
 
+    const myPid = myIdRef.current;
+    if (myPid) {
+      const ack = Number(data?.ack_seq_by_player?.[myPid] || 0);
+      if (ack > lastAckSeqRef.current) {
+        lastAckSeqRef.current = ack;
+        pendingInputsRef.current = pendingInputsRef.current.filter((ev) => ev.transportSeq > ack);
+      }
+    }
+
     const frame: SnapshotFrame = {
       t: performance.now(),
-      serverTick: Number(data.server_tick || 0),
+      serverTick: tick,
       state: cloneWorld(merged),
     };
 
@@ -439,10 +465,10 @@ export default function Page() {
       snapshotsRef.current.splice(0, snapshotsRef.current.length - 40);
     }
 
-    const tick = frame.serverTick;
-    if (tick - lastUiTickRef.current >= UI_TICK_UPDATE_EVERY || tick < lastUiTickRef.current) {
-      lastUiTickRef.current = tick;
-      setServerTick(tick);
+    const uiTick = frame.serverTick;
+    if (uiTick - lastUiTickRef.current >= UI_TICK_UPDATE_EVERY || uiTick < lastUiTickRef.current) {
+      lastUiTickRef.current = uiTick;
+      setServerTick(uiTick);
     }
 
     if (!gameStarted) setGameStarted(true);
@@ -488,6 +514,9 @@ export default function Page() {
 
         usion.game.onJoined((data: AnyObj) => {
           if (data?.room_id && data.room_id !== activeRoomIdRef.current) return;
+          pendingInputsRef.current = [];
+          lastAckSeqRef.current = 0;
+          lastNetworkTickRef.current = 0;
           setJoined(true);
           setPlayerCount((data?.player_ids || []).length);
           const waiting = Number(data?.waiting_for || 0);
@@ -507,16 +536,13 @@ export default function Page() {
           setStatus("Fight");
         });
 
-        usion.game.onRealtime((data: AnyObj) => {
-          if (data?.protocol_version === "2") onNetworkState(data);
-        });
-
         usion.game.onStateUpdate((data: AnyObj) => {
           onNetworkState(data);
         });
 
         usion.game.onGameFinished((data: AnyObj) => {
           if (data?.room_id && data.room_id !== activeRoomIdRef.current) return;
+          pendingInputsRef.current = [];
           setGameStarted(false);
           setStatus(`Match ended (${data?.reason || "done"})`);
         });
